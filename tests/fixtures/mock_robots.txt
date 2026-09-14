@@ -1,0 +1,7 @@
+User-agent: *
+Disallow: /search
+Disallow: /feed/
+Disallow: /oauth/
+Allow: /doc/
+Allow: /browse/
+Crawl-delay: 3

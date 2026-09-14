@@ -1,0 +1,28 @@
+{
+  "nodes": [
+    {
+      "id": "doc_888001",
+      "label": "Subsequent Case on 15 Feb, 2023",
+      "node_type": "judgment",
+      "court": "Delhi High Court",
+      "year": 2023
+    },
+    {
+      "id": "prec_2023_dhc_9999",
+      "label": "2023:DHC:9999",
+      "citation": "2023:DHC:9999",
+      "reporter": "Neutral Citation",
+      "node_type": "precedent",
+      "in_degree": 1,
+      "is_internal": true
+    }
+  ],
+  "links": [
+    {
+      "source": "doc_888001",
+      "target": "prec_2023_dhc_9999",
+      "treatment": "cited",
+      "role": "analysis"
+    }
+  ]
+}

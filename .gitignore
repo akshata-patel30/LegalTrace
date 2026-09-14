@@ -1,0 +1,37 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & Environment Variables
+.env
+*.local.env
+
+# Raw and bulky corpus data (managed in external volume / Parquet)
+raw-store/
+all_200_*.jsonl
+consolidated_judgments.jsonl
+discovered_200.jsonl
+scratch_*.*
+*.parquet
+
+# Search indices (generated via `python -m ingestion_source.cli index`)
+search_index/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
