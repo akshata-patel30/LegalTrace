@@ -1074,6 +1074,207 @@ def db_migrate_cmd(
         raise typer.Exit(code=1)
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: Online Legal RAG & Agentic Reasoning CLI Commands
+# ---------------------------------------------------------------------------
+
+@app.command(name="rag-plan")
+def rag_plan_cmd(
+    query: str = typer.Argument(..., help="Legal query to decompose into sub-tasks"),
+) -> None:
+    """Decompose complex legal questions into retrieval sub-tasks and target rhetorical roles."""
+    from ingestion_source.rag.planner import LegalQueryPlanner
+
+    planner = LegalQueryPlanner()
+    plan = planner.plan(query)
+
+    console.print(Panel(
+        f"Original Query: [bold cyan]\"{query}\"[/bold cyan]\n"
+        f"Detected Domain: [bold yellow]{plan.detected_domain.upper()}[/bold yellow] | Strategy: [bold green]{plan.synthesis_strategy}[/bold green]",
+        style="blue",
+        title="[bold green]LegalTrace Query Decomposition Plan[/bold green]",
+    ))
+
+    table = Table(title=f"Retrieval Sub-Tasks ({len(plan.sub_queries)} tasks)")
+    table.add_column("#", style="bold yellow", width=3)
+    table.add_column("Type", style="magenta", width=12)
+    table.add_column("Sub-Query Text", style="white")
+    table.add_column("Target Roles", style="cyan", width=25)
+    table.add_column("Top K", style="green", width=6)
+
+    for i, sq in enumerate(plan.sub_queries, 1):
+        roles_str = ", ".join(sq.target_roles) if sq.target_roles else "Any role"
+        table.add_row(
+            str(i),
+            sq.query_type.value.upper(),
+            sq.query_text,
+            roles_str,
+            str(sq.top_k),
+        )
+
+    console.print(table)
+
+
+@app.command(name="rag-query")
+def rag_query_cmd(
+    query: str = typer.Argument(..., help="Legal research question"),
+    max_chunks: int = typer.Option(8, "--max-chunks", "-k", help="Maximum evidence chunks to evaluate"),
+    index_dir: Path = typer.Option(Path("search_index"), "--index-dir", help="Path to search index directory"),
+) -> None:
+    """Execute online legal RAG with query planning, multi-hop retrieval, Shepardization, and citation-grounded synthesis."""
+    from ingestion_source.rag.synthesizer import LegalRAGSynthesizer
+    from ingestion_source.search import HybridLegalSearchEngine
+
+    if not index_dir.exists():
+        console.print(f"[bold red]Index directory {index_dir} not found. Run 'ingest index' first.[/bold red]")
+        raise typer.Exit(code=1)
+
+    with console.status("[bold green]Loading search index..."):
+        engine = HybridLegalSearchEngine(dim=384)
+        engine.load_index(index_dir)
+
+    synthesizer = LegalRAGSynthesizer(search_engine=engine)
+
+    with console.status("[bold cyan]Planning query, retrieving evidence, and synthesizing opinion..."):
+        res = synthesizer.query(user_query=query, engine=engine, max_evidence_chunks=max_chunks)
+
+    # Display Query Plan Summary
+    console.print(Panel(
+        f"Query: [bold cyan]\"{res.query}\"[/bold cyan]\n"
+        f"Domain: [bold yellow]{res.query_plan.detected_domain.upper()}[/bold yellow] | Model: [bold]{res.model_used}[/bold] | Latency: [bold green]{res.synthesis_latency_ms:.1f} ms[/bold green] | Confidence: [bold]{res.confidence * 100:.1f}%[/bold]",
+        style="blue",
+        title="[bold green]LegalTrace RAG Execution Telemetry[/bold green]",
+    ))
+
+    # Display Shepard Warnings if any
+    if res.shepard_warnings:
+        warn_panel = "\n".join(f"[bold red]•[/bold red] {w}" for w in res.shepard_warnings)
+        console.print(Panel(warn_panel, style="red", title="[bold red]Shepard's Treatment Warnings[/bold red]"))
+
+    # Synthesized Answer
+    console.print(Panel(
+        res.answer_text,
+        style="green",
+        title="[bold green]Synthesized Legal Opinion (Grounded in Evidence)[/bold green]",
+    ))
+
+    # Evidence Table
+    if res.citations:
+        table = Table(title=f"Table of Authorities & Retrieved Evidence ({len(res.citations)} passages)")
+        table.add_column("Cite", style="bold yellow", width=5)
+        table.add_column("Case Title & Court", style="bold white", width=32)
+        table.add_column("Role", style="magenta", width=14)
+        table.add_column("Score", style="cyan", width=8)
+        table.add_column("Evidence Snippet", style="white")
+
+        for c in res.citations:
+            table.add_row(
+                f"[{c.citation_index}]",
+                f"{c.case_title[:30]}...\n{c.court} ({c.year})",
+                c.rhetorical_role.upper(),
+                f"{c.relevance_score:.3f}",
+                c.text[:180] + "...",
+            )
+        console.print(table)
+
+
+@app.command(name="shepardize")
+def shepardize_cmd(
+    citation: str = typer.Argument(..., help="Precedent citation string (e.g. 'AIR 1978 SC 597')"),
+) -> None:
+    """Audit precedent treatment history across the corpus and determine whether it remains good law."""
+    from ingestion_source.rag.shepardizer import LegalShepardizer
+
+    shepardizer = LegalShepardizer()
+    res = shepardizer.check(citation)
+
+    status_color = "green" if res.is_good_law else "red" if res.status.value in ("overruled", "questioned") else "yellow"
+
+    console.print(Panel(
+        f"Precedent: [bold white]{res.precedent_citation}[/bold white] (Canonical Key: [dim]{res.canonical_id}[/dim])\n"
+        f"Status: [{status_color}][bold]{res.status.value.upper()}[/bold][/{status_color}] | Good Law: [{status_color}]{res.is_good_law}[/{status_color}] | Total Citations: [bold cyan]{res.total_citations}[/bold cyan]",
+        style="blue",
+        title="[bold green]Precedent Shepardization & Good-Law Report[/bold green]",
+    ))
+
+    if res.warning_message:
+        console.print(Panel(f"[bold yellow]{res.warning_message}[/bold yellow]", style="yellow", title="Warning Notice"))
+
+    if res.treatment_summary:
+        summary_table = Table(title="Treatment Breakdown")
+        summary_table.add_column("Treatment", style="bold white")
+        summary_table.add_column("Count", style="cyan")
+        for k, v in res.treatment_summary.items():
+            summary_table.add_row(k.upper().replace("_", " "), str(v))
+        console.print(summary_table)
+
+    if res.recent_treatments:
+        treat_table = Table(title=f"Subsequent Citing Judgments ({len(res.recent_treatments)} instances)")
+        treat_table.add_column("Citing Case Title", style="bold white", width=35)
+        treat_table.add_column("Court / Year", style="dim", width=18)
+        treat_table.add_column("Treatment", style="bold yellow", width=16)
+        treat_table.add_column("Context Snippet", style="white")
+
+        for t in res.recent_treatments[:10]:
+            treat_table.add_row(
+                t.citing_title[:33] + "...",
+                f"{t.citing_court} ({t.citing_year})",
+                t.treatment.upper().replace("_", " "),
+                t.context[:160] + "...",
+            )
+        console.print(treat_table)
+
+
+@app.command(name="memo")
+def memo_cmd(
+    query_or_doc_id: str = typer.Argument(..., help="Query for memo or doc_id for brief"),
+    doc_type: str = typer.Option("memo", "--type", "-t", help="Document type: memo | brief | bail"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Optional output text file path"),
+    index_dir: Path = typer.Option(Path("search_index"), "--index-dir", help="Path to search index directory"),
+) -> None:
+    """Generate court-ready legal memorandum, case brief, or bail application draft."""
+    from ingestion_source.rag.memo_generator import LegalMemoGenerator
+    from ingestion_source.search import HybridLegalSearchEngine
+
+    generator = LegalMemoGenerator()
+    doc_type_lower = doc_type.lower().strip()
+
+    if doc_type_lower in ("brief", "case_brief"):
+        doc = generator.generate_case_brief(doc_id=query_or_doc_id)
+    else:
+        if not index_dir.exists():
+            console.print(f"[bold red]Index directory {index_dir} not found. Run 'ingest index' first.[/bold red]")
+            raise typer.Exit(code=1)
+        engine = HybridLegalSearchEngine(dim=384)
+        engine.load_index(index_dir)
+
+        if doc_type_lower in ("bail", "bail_application"):
+            doc = generator.generate_bail_application(
+                applicant_name="Applicant",
+                fir_no="000/2023",
+                police_station="Special Cell",
+                sections_invoked=["Section 439 CrPC"],
+                custody_date="01.01.2023",
+                facts_summary=query_or_doc_id,
+                engine=engine,
+            )
+        else:
+            doc = generator.generate_legal_memorandum(query=query_or_doc_id, engine=engine)
+
+    console.print(Panel(
+        f"Title: [bold white]{doc.title}[/bold white]\n"
+        f"Type: [bold yellow]{doc.doc_type.upper()}[/bold yellow] | Generated At: [dim]{doc.generated_at}[/dim]",
+        style="blue",
+        title="[bold green]LegalTrace Document Generation[/bold green]",
+    ))
+
+    if output:
+        output.write_text(doc.content, encoding="utf-8")
+        console.print(f"[bold green][OK] Document saved to {output}[/bold green]")
+    else:
+        console.print(doc.content)
+
+
 if __name__ == "__main__":
     app()
 

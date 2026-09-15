@@ -32,13 +32,22 @@ from ingestion_source.models import (
     SearchResponse,
     SearchResultItem,
 )
+from ingestion_source.rag import (
+    GroundedAnswer,
+    LegalMemoGenerator,
+    LegalQueryPlanner,
+    LegalRAGSynthesizer,
+    LegalShepardizer,
+    QueryPlan,
+    ShepardResult,
+)
 from ingestion_source.search import HybridLegalSearchEngine
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="LegalTrace Indian Kanoon Retrieval & Search API",
-    description="High-performance legal research API for Delhi High Court judgments with hybrid vector search, rhetorical role filtering, automated headnotes, and citation graph lookup.",
+    description="High-performance legal research API for Delhi High Court judgments with hybrid vector search, rhetorical role filtering, automated headnotes, citation graph lookup, and grounded RAG reasoning.",
     version="1.0.0",
 )
 
@@ -84,6 +93,47 @@ def get_top_precedents(limit: int = 15) -> list[dict[str, Any]]:
     return _precedents_cache[:limit]
 
 
+_planner: Optional[LegalQueryPlanner] = None
+_shepardizer: Optional[LegalShepardizer] = None
+_synthesizer: Optional[LegalRAGSynthesizer] = None
+_memo_generator: Optional[LegalMemoGenerator] = None
+
+
+def get_planner() -> LegalQueryPlanner:
+    global _planner
+    if _planner is None:
+        _planner = LegalQueryPlanner()
+    return _planner
+
+
+def get_shepardizer() -> LegalShepardizer:
+    global _shepardizer
+    if _shepardizer is None:
+        _shepardizer = LegalShepardizer()
+    return _shepardizer
+
+
+def get_synthesizer() -> LegalRAGSynthesizer:
+    global _synthesizer
+    if _synthesizer is None:
+        _synthesizer = LegalRAGSynthesizer(
+            planner=get_planner(),
+            shepardizer=get_shepardizer(),
+            search_engine=get_engine(),
+        )
+    return _synthesizer
+
+
+def get_memo_generator() -> LegalMemoGenerator:
+    global _memo_generator
+    if _memo_generator is None:
+        _memo_generator = LegalMemoGenerator(
+            synthesizer=get_synthesizer(),
+            shepardizer=get_shepardizer(),
+        )
+    return _memo_generator
+
+
 # ---------------------------------------------------------------------------
 # Request & Response Schemas
 # ---------------------------------------------------------------------------
@@ -95,6 +145,29 @@ class SearchRequest(BaseModel):
     filter_role: Optional[str] = Field(None, description="Optional rhetorical role filter (e.g. analysis, facts, operative)")
     filter_court: Optional[str] = Field(None, description="Optional court filter (e.g. Delhi)")
     filter_year: Optional[int] = Field(None, description="Optional judgment year (e.g. 2023)")
+
+
+class RAGPlanRequest(BaseModel):
+    query: str = Field(..., description="Legal query to decompose into sub-tasks")
+
+
+class RAGQueryRequest(BaseModel):
+    query: str = Field(..., description="Legal question to plan, retrieve, and synthesize")
+    max_evidence_chunks: int = Field(8, ge=1, le=20, description="Max evidence chunks to evaluate")
+
+
+class RAGMemoRequest(BaseModel):
+    query: Optional[str] = Field(None, description="Legal question or subject for memo")
+    doc_type: str = Field("memo", description="Document type: memo | brief | bail")
+    doc_id: Optional[str] = Field(None, description="Document ID for case brief")
+    court: Optional[str] = Field("delhi", description="Court slug")
+    year: Optional[int] = Field(2023, description="Decision year")
+    applicant_name: Optional[str] = Field(None, description="Applicant name for bail application")
+    fir_no: Optional[str] = Field(None, description="FIR number for bail application")
+    police_station: Optional[str] = Field(None, description="Police station for bail application")
+    sections_invoked: list[str] = Field(default_factory=list, description="Sections invoked")
+    custody_date: Optional[str] = Field(None, description="Custody date string")
+    facts_summary: Optional[str] = Field(None, description="Factual matrix summary")
 
 
 class HealthResponse(BaseModel):
@@ -223,6 +296,107 @@ def get_benchmark_report() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: Online RAG & Agentic Reasoning Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/rag/plan")
+def plan_rag_query(req: RAGPlanRequest) -> dict[str, Any]:
+    """Decompose complex legal query into sub-tasks and target rhetorical roles."""
+    planner = get_planner()
+    plan = planner.plan(req.query)
+    return plan.to_dict()
+
+
+@app.post("/api/rag/query")
+def query_rag_api(req: RAGQueryRequest) -> dict[str, Any]:
+    """Execute multi-hop legal retrieval, Shepardization audit, and citation-grounded synthesis."""
+    synthesizer = get_synthesizer()
+    engine = get_engine()
+    answer = synthesizer.query(
+        user_query=req.query,
+        engine=engine,
+        max_evidence_chunks=req.max_evidence_chunks,
+    )
+    return answer.to_dict()
+
+
+@app.post("/api/rag/memo")
+def generate_memo_api(req: RAGMemoRequest) -> dict[str, Any]:
+    """Generate structured court brief, legal research memorandum, or bail application."""
+    generator = get_memo_generator()
+    engine = get_engine()
+    doc_type = req.doc_type.lower().strip()
+
+    if doc_type in ("brief", "case_brief"):
+        if not req.doc_id:
+            raise HTTPException(status_code=400, detail="doc_id is required for case brief generation.")
+        doc = generator.generate_case_brief(
+            doc_id=req.doc_id,
+            court=req.court or "delhi",
+            year=req.year or 2023,
+        )
+    elif doc_type in ("bail", "bail_application"):
+        doc = generator.generate_bail_application(
+            applicant_name=req.applicant_name or "Applicant",
+            fir_no=req.fir_no or "000/2023",
+            police_station=req.police_station or "Special Cell",
+            sections_invoked=req.sections_invoked or ["Section 439 CrPC"],
+            custody_date=req.custody_date or "01.01.2023",
+            facts_summary=req.facts_summary or req.query or "The Applicant has been falsely implicated.",
+            engine=engine,
+        )
+    else:  # default to memo
+        if not req.query:
+            raise HTTPException(status_code=400, detail="query is required for legal memorandum generation.")
+        doc = generator.generate_legal_memorandum(
+            query=req.query,
+            engine=engine,
+        )
+
+    return doc.to_dict()
+
+
+@app.get("/api/shepardize/{citation:path}")
+def shepardize_precedent_api(citation: str) -> dict[str, Any]:
+    """Audit precedent treatment history across the corpus and determine whether it remains good law."""
+    shepardizer = get_shepardizer()
+    res = shepardizer.check(citation)
+    return res.to_dict()
+
+
+@app.get("/api/graph/neighbors/{node_id:path}")
+def get_graph_neighbors(node_id: str) -> dict[str, Any]:
+    """Retrieve incoming and outgoing citation graph neighbors for a document or precedent citation."""
+    incoming: list[dict[str, Any]] = []
+    outgoing: list[dict[str, Any]] = []
+
+    clean_id = node_id.strip()
+
+    if CITATION_EDGES_PATH.exists():
+        with open(CITATION_EDGES_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                citing = str(item.get("citing_doc_id", ""))
+                prec_cit = str(item.get("precedent_citation", ""))
+                canon_id = str(item.get("canonical_precedent_id", ""))
+
+                if citing == clean_id:
+                    outgoing.append(item)
+                elif clean_id in (prec_cit, canon_id) or clean_id.lower() in prec_cit.lower():
+                    incoming.append(item)
+
+    return {
+        "node_id": clean_id,
+        "total_incoming": len(incoming),
+        "total_outgoing": len(outgoing),
+        "incoming_citations": incoming[:50],
+        "outgoing_citations": outgoing[:50],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------
 
@@ -260,13 +434,22 @@ def serve_dashboard() -> str:
       
       <!-- Tab Navigation -->
       <nav class="flex space-x-1 bg-slate-800/60 p-1 rounded-lg border border-slate-700/50">
-        <button @click="tab = 'search'" :class="tab === 'search' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3.5 py-1.5 rounded-md text-xs transition">
-          <i class="fa-solid fa-magnifying-glass mr-1.5"></i>Search & Retrieval
+        <button @click="tab = 'search'" :class="tab === 'search' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-magnifying-glass mr-1.5"></i>Search
         </button>
-        <button @click="tab = 'precedents'; loadPrecedents()" :class="tab === 'precedents' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3.5 py-1.5 rounded-md text-xs transition">
+        <button @click="tab = 'rag'" :class="tab === 'rag' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-brain mr-1.5"></i>RAG Assistant
+        </button>
+        <button @click="tab = 'shepardize'" :class="tab === 'shepardize' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3.5 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-shield-halved mr-1.5"></i>Shepardize
+        </button>
+        <button @click="tab = 'memo'" :class="tab === 'memo' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3.5 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-file-contract mr-1.5"></i>Memo & Drafts
+        </button>
+        <button @click="tab = 'precedents'; loadPrecedents()" :class="tab === 'precedents' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-network-wired mr-1.5"></i>Citation Graph
         </button>
-        <button @click="tab = 'benchmark'; loadBenchmark()" :class="tab === 'benchmark' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3.5 py-1.5 rounded-md text-xs transition">
+        <button @click="tab = 'benchmark'; loadBenchmark()" :class="tab === 'benchmark' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-chart-line mr-1.5"></i>Benchmark QA
         </button>
       </nav>
@@ -428,7 +611,391 @@ def serve_dashboard() -> str:
     </div>
 
     <!-- ================================================================= -->
-    <!-- TAB 2: CITATION GRAPH & LANDMARK PRECEDENTS -->
+    <!-- TAB: LEGAL RAG ASSISTANT (PIPELINE B) -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'rag'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <h2 class="text-base font-bold text-white mb-2 flex items-center">
+          <i class="fa-solid fa-brain text-indigo-400 mr-2"></i>
+          Online Legal RAG & Agentic Reasoning (Groq LLM + Hybrid Corpus)
+        </h2>
+        <p class="text-xs text-slate-400 mb-6">Decomposes complex legal queries into sub-tasks, performs multi-hop semantic retrieval, checks precedent good-law status, and synthesizes answers with strict inline [N] citations.</p>
+
+        <form @submit.prevent="executeRAG">
+          <div class="relative">
+            <i class="fa-solid fa-scale-balanced absolute left-4 top-4 text-slate-400 text-lg"></i>
+            <input 
+              type="text" 
+              x-model="ragQuery" 
+              placeholder="Ask a legal research question (e.g. 'What are the mandatory conditions for regular bail involving commercial quantity under Section 37 NDPS Act?')..."
+              class="w-full pl-12 pr-32 py-3.5 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm shadow-inner"
+            />
+            <button 
+              type="submit" 
+              :disabled="ragLoading"
+              class="absolute right-2 top-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-md transition"
+            >
+              <span x-show="!ragLoading"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i>Ask RAG</span>
+              <span x-show="ragLoading"><i class="fa-solid fa-spinner fa-spin mr-1"></i>Reasoning...</span>
+            </button>
+          </div>
+
+          <div class="mt-4 flex flex-wrap items-center gap-4 text-xs text-slate-300">
+            <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+              <span class="text-slate-400 font-medium">Max Evidence Chunks:</span>
+              <select x-model.number="ragMaxChunks" class="bg-transparent text-slate-200 focus:outline-none cursor-pointer">
+                <option value="4" class="bg-slate-800">4 chunks</option>
+                <option value="8" class="bg-slate-800" selected>8 chunks</option>
+                <option value="12" class="bg-slate-800">12 chunks</option>
+              </select>
+            </div>
+
+            <div class="flex items-center space-x-1 ml-auto">
+              <span class="text-slate-500 mr-1">Sample queries:</span>
+              <button type="button" @click="ragQuery = 'What are the mandatory conditions for regular bail involving commercial quantity under Section 37 NDPS Act?'; executeRAG()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 transition">NDPS Bail</button>
+              <button type="button" @click="ragQuery = 'Can an arbitral award be set aside for patent illegality under Section 34 of the Arbitration Act?'; executeRAG()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 transition">Arbitration</button>
+              <button type="button" @click="ragQuery = 'Under what circumstances can an FIR be quashed under Section 482 CrPC upon matrimonial settlement?'; executeRAG()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 transition">Quash FIR</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <!-- RAG Result Section -->
+      <div x-show="ragResult" class="space-y-6">
+        <!-- Telemetry & Confidence Banner -->
+        <div class="bg-slate-800/80 rounded-xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-4 font-mono text-xs">
+          <div class="flex items-center space-x-3">
+            <span class="px-2.5 py-1 rounded bg-indigo-950 text-indigo-300 border border-indigo-800 font-bold" x-text="'Model: ' + ragResult?.model_used"></span>
+            <span class="text-slate-400">Latency: <span class="text-emerald-400 font-bold" x-text="ragResult?.synthesis_latency_ms?.toFixed(1) + ' ms'"></span></span>
+            <span class="text-slate-400">Evidence Passages: <span class="text-white font-bold" x-text="ragResult?.total_chunks_examined"></span></span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="text-slate-400">Confidence Score:</span>
+            <span class="px-2 py-0.5 rounded text-xs font-bold" :class="ragResult?.confidence >= 0.7 ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' : 'bg-amber-950 text-amber-300 border border-amber-800'" x-text="(ragResult?.confidence * 100)?.toFixed(1) + '%'"></span>
+          </div>
+        </div>
+
+        <!-- Shepardization Warnings (if any) -->
+        <div x-show="ragResult?.shepard_warnings?.length > 0" class="bg-rose-950/40 border border-rose-800/80 rounded-xl p-4">
+          <div class="flex items-center space-x-2 text-rose-300 font-bold text-xs mb-2">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            <span>Shepard's Treatment Warnings Detected in Retrieved Precedents</span>
+          </div>
+          <ul class="list-disc list-inside space-y-1 text-xs text-rose-200/90 font-mono">
+            <template x-for="w in ragResult?.shepard_warnings" :key="w">
+              <li x-text="w"></li>
+            </template>
+          </ul>
+        </div>
+
+        <!-- Query Plan Accordion -->
+        <div class="bg-slate-800/50 rounded-xl border border-slate-700/80 p-4">
+          <button @click="showPlan = !showPlan" class="w-full flex items-center justify-between text-xs font-semibold text-slate-300 hover:text-white">
+            <span class="flex items-center"><i class="fa-solid fa-list-check text-indigo-400 mr-2"></i>Multi-Hop Query Decomposition Plan (<span x-text="ragResult?.query_plan?.sub_queries?.length || 0"></span> sub-tasks)</span>
+            <i class="fa-solid" :class="showPlan ? 'fa-chevron-up' : 'fa-chevron-down'"></i>
+          </button>
+          <div x-show="showPlan" class="mt-3 space-y-2 border-t border-slate-700/60 pt-3">
+            <div class="text-xs text-slate-400 font-mono">Domain: <span class="text-indigo-300 font-bold" x-text="ragResult?.query_plan?.detected_domain?.toUpperCase()"></span> | Strategy: <span class="text-emerald-300 font-bold" x-text="ragResult?.query_plan?.synthesis_strategy"></span></div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+              <template x-for="(sq, idx) in ragResult?.query_plan?.sub_queries" :key="idx">
+                <div class="bg-slate-900/80 p-3 rounded-lg border border-slate-800 text-xs font-mono">
+                  <div class="flex items-center justify-between text-[11px] mb-1">
+                    <span class="text-indigo-400 font-bold" x-text="'Sub-query #' + (idx + 1) + ' [' + sq.query_type.toUpperCase() + ']'"></span>
+                    <span class="text-slate-500" x-text="'Top ' + sq.top_k"></span>
+                  </div>
+                  <div class="text-slate-200 text-xs font-sans mb-1" x-text="sq.query_text"></div>
+                  <div class="text-[10px] text-slate-400">Target Roles: <span class="text-amber-300" x-text="(sq.target_roles || []).join(', ') || 'Any'"></span></div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Synthesized Answer Card -->
+        <div class="bg-slate-800/90 rounded-2xl p-6 border border-slate-700 shadow-xl">
+          <div class="flex items-center justify-between mb-4 pb-3 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-white flex items-center">
+              <i class="fa-solid fa-gavel text-indigo-400 mr-2"></i>
+              Synthesized Legal Opinion & Grounded Ratio
+            </h3>
+            <span class="text-xs font-mono text-slate-400">Strictly Grounded in Delhi High Court Corpus</span>
+          </div>
+          <div class="prose prose-invert max-w-none text-slate-200 text-sm leading-relaxed font-serif whitespace-pre-wrap" x-text="ragResult?.answer_text"></div>
+        </div>
+
+        <!-- Evidence Citations Table -->
+        <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl">
+          <h3 class="text-sm font-bold text-white mb-4 flex items-center">
+            <i class="fa-solid fa-book-bookmark text-indigo-400 mr-2"></i>
+            Table of Authorities & Ground Truth Passages (<span x-text="ragResult?.citations?.length || 0"></span> Passages)
+          </h3>
+          <div class="space-y-3">
+            <template x-for="cit in ragResult?.citations" :key="cit.chunk_id">
+              <div class="bg-slate-900 p-4 rounded-xl border border-slate-800 text-xs">
+                <div class="flex items-center justify-between mb-2">
+                  <div class="flex items-center space-x-2 font-mono">
+                    <span class="px-2 py-0.5 rounded bg-indigo-600 text-white font-bold text-xs" x-text="'[' + cit.citation_index + ']'"></span>
+                    <span class="font-bold text-white font-sans text-xs" x-text="cit.case_title"></span>
+                    <span class="text-slate-400" x-text="'(' + cit.court + ', ' + cit.year + ')'"></span>
+                  </div>
+                  <div class="flex items-center space-x-2">
+                    <span class="px-2 py-0.5 rounded font-mono text-[11px] font-bold" :class="getRoleBadgeClass(cit.rhetorical_role)" x-text="cit.rhetorical_role.toUpperCase()"></span>
+                    <span class="text-slate-400 font-mono text-[11px]" x-text="'Score: ' + cit.relevance_score.toFixed(3)"></span>
+                  </div>
+                </div>
+                <p class="text-slate-300 font-serif leading-relaxed bg-slate-950/60 p-3 rounded border border-slate-800/60 text-xs" x-text="cit.text"></p>
+                <div class="mt-2 flex items-center justify-between text-[11px] text-slate-400 font-mono">
+                  <span>Doc ID: <span class="text-indigo-400" x-text="cit.doc_id"></span> | Chunk ID: <span class="text-slate-500" x-text="cit.chunk_id"></span></span>
+                  <button @click="openHeadnote(cit.doc_id)" class="text-indigo-400 hover:text-indigo-300">View Headnote &rarr;</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- TAB: SHEPARDIZE PRECEDENT CHECKER -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'shepardize'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <h2 class="text-base font-bold text-white mb-2 flex items-center">
+          <i class="fa-solid fa-shield-halved text-indigo-400 mr-2"></i>
+          Precedent Shepardization & Good-Law Checker
+        </h2>
+        <p class="text-xs text-slate-400 mb-6">Audits the judicial history of any legal precedent across subsequent High Court judgments to determine whether it remains binding good law, or has been distinguished, cautioned, or overruled.</p>
+
+        <form @submit.prevent="executeShepardize">
+          <div class="relative">
+            <i class="fa-solid fa-quote-left absolute left-4 top-4 text-slate-400 text-lg"></i>
+            <input 
+              type="text" 
+              x-model="shepCitation" 
+              placeholder="Enter standard Indian legal citation (e.g. 'AIR 1978 SC 597' or '(2014) 8 SCC 273')..."
+              class="w-full pl-12 pr-32 py-3.5 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm shadow-inner font-mono"
+            />
+            <button 
+              type="submit" 
+              :disabled="shepLoading"
+              class="absolute right-2 top-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-md transition"
+            >
+              <span x-show="!shepLoading"><i class="fa-solid fa-magnifying-glass mr-1"></i>Check Law</span>
+              <span x-show="shepLoading"><i class="fa-solid fa-spinner fa-spin mr-1"></i>Auditing...</span>
+            </button>
+          </div>
+
+          <div class="mt-4 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <span>Quick sample citations:</span>
+            <button type="button" @click="shepCitation = 'AIR 1978 SC 597'; executeShepardize()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">AIR 1978 SC 597 (Maneka Gandhi)</button>
+            <button type="button" @click="shepCitation = '(2014) 8 SCC 273'; executeShepardize()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">(2014) 8 SCC 273 (Arnesh Kumar)</button>
+            <button type="button" @click="shepCitation = 'AIR 1973 SC 1461'; executeShepardize()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">AIR 1973 SC 1461 (Kesavananda)</button>
+            <button type="button" @click="shepCitation = '2023:DHC:2692'; executeShepardize()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">2023:DHC:2692</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Shepardization Result -->
+      <div x-show="shepResult" class="space-y-6">
+        <div class="bg-slate-800/90 rounded-2xl p-6 border border-slate-700 shadow-xl">
+          <div class="flex flex-wrap items-start justify-between gap-4 pb-6 border-b border-slate-700">
+            <div>
+              <div class="text-xs font-mono text-slate-400 mb-1">Precedent Authority</div>
+              <h3 class="text-lg font-bold text-white font-mono" x-text="shepResult?.precedent_citation"></h3>
+              <div class="text-xs text-slate-400 font-mono mt-1">Canonical Key: <span class="text-indigo-400" x-text="shepResult?.canonical_id"></span></div>
+            </div>
+
+            <!-- Status Badge -->
+            <div class="text-right">
+              <div class="text-xs font-mono text-slate-400 mb-1">Judicial Standing</div>
+              <span class="px-4 py-2 rounded-xl text-sm font-bold font-mono tracking-wide inline-block shadow-lg" :class="getShepBadgeClass(shepResult?.status)">
+                <i class="fa-solid mr-1.5" :class="getShepIcon(shepResult?.status)"></i>
+                <span x-text="shepResult?.status?.toUpperCase()?.replace('_', ' ')"></span>
+              </span>
+            </div>
+          </div>
+
+          <!-- Treatment Statistics Bar -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-6">
+            <div class="bg-slate-900 p-4 rounded-xl border border-slate-800">
+              <div class="text-[11px] uppercase font-mono text-slate-400">Total Citations</div>
+              <div class="text-2xl font-bold text-white font-mono mt-1" x-text="shepResult?.total_citations || 0"></div>
+            </div>
+            <div class="bg-slate-900 p-4 rounded-xl border border-slate-800">
+              <div class="text-[11px] uppercase font-mono text-slate-400">Relied Upon / Followed</div>
+              <div class="text-2xl font-bold text-emerald-400 font-mono mt-1" x-text="shepResult?.treatment_summary?.relied_upon || 0"></div>
+            </div>
+            <div class="bg-slate-900 p-4 rounded-xl border border-slate-800">
+              <div class="text-[11px] uppercase font-mono text-slate-400">Distinguished on Facts</div>
+              <div class="text-2xl font-bold text-amber-400 font-mono mt-1" x-text="shepResult?.treatment_summary?.distinguished || 0"></div>
+            </div>
+            <div class="bg-slate-900 p-4 rounded-xl border border-slate-800">
+              <div class="text-[11px] uppercase font-mono text-slate-400">Overruled / Disapproved</div>
+              <div class="text-2xl font-bold text-rose-400 font-mono mt-1" x-text="shepResult?.treatment_summary?.overruled || 0"></div>
+            </div>
+          </div>
+
+          <!-- Warning Message (if any) -->
+          <div x-show="shepResult?.warning_message" class="mt-6 p-4 rounded-xl border" :class="shepResult?.is_good_law ? 'bg-amber-950/40 border-amber-800/80 text-amber-200' : 'bg-rose-950/40 border-rose-800/80 text-rose-200'">
+            <div class="font-bold text-xs flex items-center mb-1">
+              <i class="fa-solid fa-triangle-exclamation mr-1.5"></i>Judicial Caution Notice
+            </div>
+            <p class="text-xs font-mono" x-text="shepResult?.warning_message"></p>
+          </div>
+        </div>
+
+        <!-- Citing Cases Stream -->
+        <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl">
+          <h3 class="text-sm font-bold text-white mb-4 flex items-center">
+            <i class="fa-solid fa-landmark text-indigo-400 mr-2"></i>
+            Subsequent Citing Judgments in Corpus (<span x-text="shepResult?.recent_treatments?.length || 0"></span> instances)
+          </h3>
+          <div class="space-y-3">
+            <template x-for="t in shepResult?.recent_treatments" :key="t.citing_doc_id + t.treatment">
+              <div class="bg-slate-900 p-4 rounded-xl border border-slate-800 text-xs">
+                <div class="flex items-center justify-between mb-2">
+                  <div>
+                    <h4 class="font-bold text-white text-xs" x-text="t.citing_title"></h4>
+                    <div class="text-slate-400 font-mono text-[11px]">
+                      <span x-text="t.citing_court"></span> • <span x-text="'Year ' + t.citing_year"></span> • <span>Doc ID: </span><span class="text-indigo-400 font-bold" x-text="t.citing_doc_id"></span>
+                    </div>
+                  </div>
+                  <span class="px-2.5 py-1 rounded font-mono text-[11px] font-bold" :class="getTreatmentBadgeClass(t.treatment)" x-text="t.treatment.toUpperCase().replace('_', ' ')"></span>
+                </div>
+                <p class="text-slate-300 font-serif leading-relaxed bg-slate-950/60 p-3 rounded border border-slate-800/60 text-xs" x-text="t.context"></p>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- TAB: LEGAL MEMORANDUM & COURT DRAFT GENERATOR -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'memo'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <h2 class="text-base font-bold text-white mb-2 flex items-center">
+          <i class="fa-solid fa-file-contract text-indigo-400 mr-2"></i>
+          Automated Legal Document & Court Pleading Generator
+        </h2>
+        <p class="text-xs text-slate-400 mb-6">Generate formal appellate chamber briefs, exhaustive legal research memorandums, or Section 439 CrPC regular bail applications grounded in corpus precedents.</p>
+
+        <!-- Document Type Selector -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
+          <button 
+            type="button" 
+            @click="memoDocType = 'memo'" 
+            :class="memoDocType === 'memo' ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'"
+            class="p-3.5 rounded-xl border text-left transition"
+          >
+            <div class="font-bold text-xs flex items-center"><i class="fa-solid fa-book-open mr-2"></i>Legal Memorandum</div>
+            <div class="text-[11px] text-slate-400 mt-1">Exhaustive research memo on an issue with citations</div>
+          </button>
+          <button 
+            type="button" 
+            @click="memoDocType = 'brief'" 
+            :class="memoDocType === 'brief' ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'"
+            class="p-3.5 rounded-xl border text-left transition"
+          >
+            <div class="font-bold text-xs flex items-center"><i class="fa-solid fa-briefcase mr-2"></i>Appellate Case Brief</div>
+            <div class="text-[11px] text-slate-400 mt-1">Structured briefing from an ingested judgment ID</div>
+          </button>
+          <button 
+            type="button" 
+            @click="memoDocType = 'bail'" 
+            :class="memoDocType === 'bail' ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'"
+            class="p-3.5 rounded-xl border text-left transition"
+          >
+            <div class="font-bold text-xs flex items-center"><i class="fa-solid fa-scale-unbalanced mr-2"></i>Bail Application (CrPC 439)</div>
+            <div class="text-[11px] text-slate-400 mt-1">High Court court-ready bail pleading draft</div>
+          </button>
+        </div>
+
+        <form @submit.prevent="executeGenerateMemo">
+          <!-- Form for Legal Memorandum -->
+          <div x-show="memoDocType === 'memo'" class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Subject / Question for Legal Memorandum</label>
+              <input type="text" x-model="memoQuery" placeholder="e.g. Section 34 Arbitration Act grounds of patent illegality" class="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-xs placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+          </div>
+
+          <!-- Form for Case Brief -->
+          <div x-show="memoDocType === 'brief'" class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Judgment Document ID</label>
+              <input type="text" x-model="memoDocId" placeholder="e.g. 104774187" class="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-xs placeholder-slate-500 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+          </div>
+
+          <!-- Form for Bail Application -->
+          <div x-show="memoDocType === 'bail'" class="space-y-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs font-medium text-slate-300 mb-1">Applicant / Accused Name</label>
+                <input type="text" x-model="memoApplicant" placeholder="e.g. Ramesh Kumar" class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs" />
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-300 mb-1">FIR Number</label>
+                <input type="text" x-model="memoFirNo" placeholder="e.g. 124/2023" class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs" />
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-300 mb-1">Police Station</label>
+                <input type="text" x-model="memoStation" placeholder="e.g. Special Cell, Lodhi Colony" class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs" />
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-300 mb-1">Custody Date</label>
+                <input type="text" x-model="memoCustody" placeholder="e.g. 15.02.2023" class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs" />
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Sections Invoked (comma-separated)</label>
+              <input type="text" x-model="memoSections" placeholder="e.g. Section 20, 29 NDPS Act" class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs" />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Factual Matrix Summary</label>
+              <textarea x-model="memoFacts" rows="3" placeholder="Brief facts of the arrest and alleged recovery..." class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-xs"></textarea>
+            </div>
+          </div>
+
+          <div class="mt-6 flex justify-end">
+            <button 
+              type="submit" 
+              :disabled="memoLoading"
+              class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-lg transition flex items-center"
+            >
+              <span x-show="!memoLoading"><i class="fa-solid fa-file-arrow-down mr-1.5"></i>Generate Document</span>
+              <span x-show="memoLoading"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i>Drafting Legal Document...</span>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Document Preview Output Card -->
+      <div x-show="memoResult" class="bg-slate-800/90 rounded-2xl p-6 border border-slate-700 shadow-xl space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-700">
+          <div>
+            <h3 class="text-base font-bold text-white font-sans" x-text="memoResult?.title"></h3>
+            <div class="text-xs text-slate-400 font-mono mt-1" x-text="'Generated: ' + memoResult?.generated_at"></div>
+          </div>
+          <div class="flex space-x-2">
+            <button @click="copyMemoText" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-xs font-medium transition flex items-center">
+              <i class="fa-solid fa-copy mr-1.5"></i>
+              <span x-text="copySuccess ? 'Copied!' : 'Copy Text'"></span>
+            </button>
+            <button @click="downloadMemoText" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-medium transition flex items-center">
+              <i class="fa-solid fa-download mr-1.5"></i>Download .txt
+            </button>
+          </div>
+        </div>
+
+        <pre class="bg-slate-950 p-6 rounded-xl border border-slate-800 text-slate-200 font-mono text-xs leading-relaxed whitespace-pre-wrap max-h-[60vh] overflow-y-auto" x-text="memoResult?.content"></pre>
+      </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- TAB: CITATION GRAPH & LANDMARK PRECEDENTS -->
     <!-- ================================================================= -->
     <div x-show="tab === 'precedents'" x-cloak x-transition>
       <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl">
@@ -585,6 +1152,32 @@ def serve_dashboard() -> str:
         precedents: [],
         activeHeadnote: null,
 
+        // RAG State
+        ragQuery: 'What are the mandatory conditions for regular bail involving commercial quantity under Section 37 NDPS Act?',
+        ragMaxChunks: 8,
+        ragLoading: false,
+        ragResult: null,
+        showPlan: false,
+
+        // Shepardize State
+        shepCitation: 'AIR 1978 SC 597',
+        shepLoading: false,
+        shepResult: null,
+
+        // Memo Generator State
+        memoDocType: 'memo',
+        memoQuery: 'Section 34 Arbitration Act grounds of patent illegality and public policy',
+        memoDocId: '104774187',
+        memoApplicant: 'Ramesh Kumar',
+        memoFirNo: '142/2023',
+        memoStation: 'Special Cell, New Delhi',
+        memoSections: 'Section 20(b)(ii)(C), Section 29 NDPS Act',
+        memoCustody: '10.02.2023',
+        memoFacts: 'Applicant was arrested on alleged recovery of contraband from co-accused. No direct recovery was effected from the personal possession of the applicant.',
+        memoLoading: false,
+        memoResult: null,
+        copySuccess: false,
+
         async init() {
           this.executeSearch();
         },
@@ -613,6 +1206,137 @@ def serve_dashboard() -> str:
           } finally {
             this.loading = false;
           }
+        },
+
+        async executeRAG() {
+          if (!this.ragQuery.trim()) return;
+          this.ragLoading = true;
+          try {
+            const res = await fetch('/api/rag/query', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query: this.ragQuery,
+                max_evidence_chunks: this.ragMaxChunks
+              })
+            });
+            if (!res.ok) throw new Error('RAG query failed');
+            this.ragResult = await res.json();
+          } catch (err) {
+            console.error(err);
+            alert('Failed to execute RAG reasoning: ' + err.message);
+          } finally {
+            this.ragLoading = false;
+          }
+        },
+
+        async executeShepardize() {
+          if (!this.shepCitation.trim()) return;
+          this.shepLoading = true;
+          try {
+            const citEnc = encodeURIComponent(this.shepCitation.trim());
+            const res = await fetch('/api/shepardize/' + citEnc);
+            if (!res.ok) throw new Error('Shepardize check failed');
+            this.shepResult = await res.json();
+          } catch (err) {
+            console.error(err);
+            alert('Failed to audit precedent: ' + err.message);
+          } finally {
+            this.shepLoading = false;
+          }
+        },
+
+        async executeGenerateMemo() {
+          this.memoLoading = true;
+          try {
+            const sections = (this.memoSections || '').split(',').map(s => s.trim()).filter(Boolean);
+            const payload = {
+              doc_type: this.memoDocType,
+              query: this.memoQuery,
+              doc_id: this.memoDocId,
+              court: 'delhi',
+              year: 2023,
+              applicant_name: this.memoApplicant,
+              fir_no: this.memoFirNo,
+              police_station: this.memoStation,
+              sections_invoked: sections,
+              custody_date: this.memoCustody,
+              facts_summary: this.memoFacts
+            };
+
+            const res = await fetch('/api/rag/memo', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+              const errData = await res.json();
+              throw new Error(errData.detail || 'Memo generation failed');
+            }
+            this.memoResult = await res.json();
+          } catch (err) {
+            console.error(err);
+            alert('Error drafting legal document: ' + err.message);
+          } finally {
+            this.memoLoading = false;
+          }
+        },
+
+        copyMemoText() {
+          if (!this.memoResult || !this.memoResult.content) return;
+          navigator.clipboard.writeText(this.memoResult.content).then(() => {
+            this.copySuccess = true;
+            setTimeout(() => { this.copySuccess = false; }, 2000);
+          });
+        },
+
+        downloadMemoText() {
+          if (!this.memoResult || !this.memoResult.content) return;
+          const blob = new Blob([this.memoResult.content], { type: 'text/plain;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = (this.memoResult.title || 'LegalTrace_Document').replace(/[^a-zA-Z0-9_-]/g, '_') + '.txt';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        },
+
+        getShepBadgeClass(status) {
+          const map = {
+            'good_law': 'bg-emerald-950 text-emerald-300 border border-emerald-800',
+            'distinguished': 'bg-amber-950 text-amber-300 border border-amber-800',
+            'caution': 'bg-yellow-950 text-yellow-300 border border-yellow-800',
+            'overruled': 'bg-rose-950 text-rose-300 border border-rose-800',
+            'questioned': 'bg-purple-950 text-purple-300 border border-purple-800',
+            'unknown': 'bg-slate-800 text-slate-300 border border-slate-700'
+          };
+          return map[status] || 'bg-slate-800 text-slate-300';
+        },
+
+        getShepIcon(status) {
+          const map = {
+            'good_law': 'fa-circle-check text-emerald-400',
+            'distinguished': 'fa-triangle-exclamation text-amber-400',
+            'caution': 'fa-circle-exclamation text-yellow-400',
+            'overruled': 'fa-circle-xmark text-rose-400',
+            'questioned': 'fa-circle-question text-purple-400',
+            'unknown': 'fa-circle-question text-slate-400'
+          };
+          return map[status] || 'fa-circle-info';
+        },
+
+        getTreatmentBadgeClass(treatment) {
+          const map = {
+            'relied_upon': 'bg-emerald-950 text-emerald-300 border border-emerald-800',
+            'followed': 'bg-emerald-950 text-emerald-300 border border-emerald-800',
+            'distinguished': 'bg-amber-950 text-amber-300 border border-amber-800',
+            'overruled': 'bg-rose-950 text-rose-300 border border-rose-800',
+            'caution': 'bg-yellow-950 text-yellow-300 border border-yellow-800',
+            'cited': 'bg-indigo-950 text-indigo-300 border border-indigo-800'
+          };
+          return map[treatment] || 'bg-slate-800 text-slate-300';
         },
 
         async loadPrecedents() {
