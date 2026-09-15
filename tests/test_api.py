@@ -237,3 +237,32 @@ def test_graph_neighbors_endpoint():
     assert data["total_outgoing"] >= 1
     assert "outgoing_citations" in data
 
+
+def test_binding_authorities_endpoint():
+    """Verify GET /api/graph/binding/{doc_id} returns Supreme Court Article 141 binding precedents."""
+    response = client.get("/api/graph/binding/104774187")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["doc_id"] == "104774187"
+    assert "total_binding_authorities" in data
+    assert "article_141_declaration" in data
+    assert isinstance(data["authorities"], list)
+
+
+def test_hierarchy_endpoint():
+    """Verify GET /api/graph/hierarchy returns judicial tier citation breakdown."""
+    response = client.get("/api/graph/hierarchy")
+    assert response.status_code == 200
+    data = response.json()
+    assert "court_scope" in data
+    assert "total_citations" in data
+    assert "hierarchy_breakdown" in data
+
+
+def test_batch_status_endpoint():
+    """Verify GET /api/batch/status returns batch ingestion jobs from PostgreSQL."""
+    response = client.get("/api/batch/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+

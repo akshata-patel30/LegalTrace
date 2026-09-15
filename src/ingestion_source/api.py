@@ -396,6 +396,55 @@ def get_graph_neighbors(node_id: str) -> dict[str, Any]:
     }
 
 
+_graph_store: Any = None
+
+
+def get_graph_store():
+    global _graph_store
+    if _graph_store is None:
+        from ingestion_source.db.graph_store import FalkorGraphStore
+        _graph_store = FalkorGraphStore()
+    return _graph_store
+
+
+@app.get("/api/graph/binding/{doc_id}")
+def get_binding_authorities(doc_id: str) -> dict[str, Any]:
+    """Retrieve binding Supreme Court authorities for a judgment under Article 141 of the Constitution of India."""
+    store = get_graph_store()
+    try:
+        authorities = store.get_binding_authority_chain(doc_id)
+    except Exception as e:
+        logger.warning("FalkorDB query failed in get_binding_authorities: %s", e)
+        authorities = []
+
+    return {
+        "doc_id": doc_id,
+        "total_binding_authorities": len(authorities),
+        "article_141_declaration": "Law declared by the Supreme Court shall be binding on all courts within the territory of India.",
+        "authorities": authorities,
+    }
+
+
+@app.get("/api/graph/hierarchy")
+def get_hierarchy_influence(court: Optional[str] = None) -> dict[str, Any]:
+    """Analyze breakdown of Supreme Court binding citations vs coordinate High Court citations."""
+    store = get_graph_store()
+    try:
+        data = store.get_court_hierarchy_influence(court_slug=court)
+    except Exception as e:
+        logger.warning("FalkorDB query failed in get_hierarchy_influence: %s", e)
+        data = {"court_scope": court or "All Courts", "total_citations": 0, "hierarchy_breakdown": {}}
+    return data
+
+
+@app.get("/api/batch/status")
+async def get_batch_status_api() -> list[dict[str, Any]]:
+    """Retrieve progress and telemetry for all multi-court batch ingestion jobs in PostgreSQL."""
+    from ingestion_source.batch_ingest import BatchIngestionOrchestrator
+    orchestrator = BatchIngestionOrchestrator()
+    return await orchestrator.get_all_batch_status()
+
+
 # ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------

@@ -70,13 +70,22 @@ class Settings(BaseSettings):
             return cleaned or None
         return v
 
-    # Target Scope
+    # Target Scope (Phase 3: Multi-Jurisdictional Nationwide Coverage)
     TARGET_COURTS: list[str] = Field(
-        default=["Delhi High Court", "Supreme Court of India"],
-        description="Target courts to acquire"
+        default=[
+            "Delhi High Court",
+            "Supreme Court of India",
+            "Bombay High Court",
+            "Madras High Court",
+            "Karnataka High Court",
+        ],
+        description="Target courts to acquire",
     )
-    TARGET_YEARS: list[int] = Field(default=[2023], description="Target years to acquire")
-    SAMPLE_LIMIT: int = Field(default=1000, description="Maximum total documents to ingest in a run")
+    TARGET_YEARS: list[int] = Field(
+        default=[2020, 2021, 2022, 2023, 2024],
+        description="Target years to acquire",
+    )
+    SAMPLE_LIMIT: int = Field(default=25000, description="Maximum total documents to ingest in a run")
 
     # Storage & Persistence
     INTAKE_OUTPUT_PATH: Path = Field(default=Path("./raw-store"), description="Directory where raw documents are written")

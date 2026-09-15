@@ -55,7 +55,7 @@ class QdrantVectorStore:
         self.url = url
         self.collection_name = collection_name
         self.dim = dim
-        self.client = client or QdrantClient(url=url, timeout=timeout)
+        self.client = client or QdrantClient(url=url, timeout=timeout, check_compatibility=False)
 
     @staticmethod
     def chunk_id_to_point_id(chunk_id: str) -> int:

@@ -1275,6 +1275,107 @@ def memo_cmd(
         console.print(doc.content)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3: Multi-Court Corpus Expansion Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command(name="batch-ingest")
+def batch_ingest(
+    courts: Optional[list[str]] = typer.Option(None, "--court", "-c", help="Target court(s) to ingest"),
+    years: Optional[list[int]] = typer.Option(None, "--year", "-y", help="Target decision year(s)"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max documents per court-year batch"),
+    workers: int = typer.Option(2, "--workers", "-w", help="Number of concurrent worker threads"),
+    batch_size: int = typer.Option(50, "--batch-size", help="Batch size for database upserts"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-ingestion of completed batches"),
+    mode: str = typer.Option("api", "--mode", "-m", help="Fetch mode: api, hybrid, scrape_only"),
+) -> None:
+    """Run multi-court, multi-year corpus expansion directly into PostgreSQL, Qdrant, and FalkorDB (Phase 3)."""
+    import asyncio
+    from ingestion_source.batch_ingest import BatchIngestionOrchestrator
+
+    settings = get_settings()
+    target_courts = courts or settings.TARGET_COURTS
+    target_years = years or settings.TARGET_YEARS
+    target_limit = limit if limit is not None else settings.SAMPLE_LIMIT
+
+    console.print(Panel(
+        f"[bold white]LegalTrace Multi-Court Corpus Expansion (Phase 3)[/bold white]\n"
+        f"Courts ({len(target_courts)}): [cyan]{', '.join(target_courts)}[/cyan]\n"
+        f"Years ({len(target_years)}): [cyan]{', '.join(str(y) for y in target_years)}[/cyan]\n"
+        f"Batch Limit: [yellow]{target_limit}[/yellow] | Workers: [yellow]{workers}[/yellow] | Force: [yellow]{force}[/yellow]",
+        style="blue",
+    ))
+
+    orchestrator = BatchIngestionOrchestrator(settings=settings)
+    report = asyncio.run(
+        orchestrator.run_batch(
+            courts=target_courts,
+            years=target_years,
+            sample_limit=target_limit,
+            batch_size=batch_size,
+            workers=workers,
+            force=force,
+            mode=mode,
+        )
+    )
+
+    table = Table(title="[bold green]Batch Corpus Expansion Summary[/bold green]")
+    table.add_column("Metric", style="bold white")
+    table.add_column("Value", style="cyan")
+    table.add_row("Total Batches", str(report.total_batches))
+    table.add_row("Completed Batches", f"[green]{report.completed_batches}[/green]")
+    table.add_row("Failed Batches", f"[red]{report.failed_batches}[/red]" if report.failed_batches else "0")
+    table.add_row("Skipped Batches", f"[yellow]{report.skipped_batches}[/yellow]" if report.skipped_batches else "0")
+    table.add_row("Total Docs Discovered", f"{report.total_docs_discovered:,}")
+    table.add_row("Total Docs Fetched", f"{report.total_docs_fetched:,}")
+    table.add_row("Total Docs Indexed (PostgreSQL)", f"[green]{report.total_docs_indexed:,}[/green]")
+    table.add_row("Total Semantic Chunks (Qdrant)", f"[green]{report.total_chunks_indexed:,}[/green]")
+    table.add_row("Total Citation Edges (FalkorDB)", f"[green]{report.total_edges_indexed:,}[/green]")
+    table.add_row("Total Execution Time", f"{report.elapsed_seconds:.2f}s")
+    console.print(table)
+
+
+@app.command(name="batch-status")
+def batch_status() -> None:
+    """Display progress and telemetry of all batch ingestion jobs stored in PostgreSQL."""
+    import asyncio
+    from ingestion_source.batch_ingest import BatchIngestionOrchestrator
+
+    orchestrator = BatchIngestionOrchestrator()
+    jobs = asyncio.run(orchestrator.get_all_batch_status())
+
+    if not jobs:
+        console.print("[yellow]No batch ingestion jobs found in PostgreSQL database.[/yellow]")
+        return
+
+    table = Table(title="[bold green]PostgreSQL Batch Ingestion Telemetry (Phase 3)[/bold green]")
+    table.add_column("Batch ID", style="bold white")
+    table.add_column("Court", style="cyan")
+    table.add_column("Year", style="yellow")
+    table.add_column("Status", style="magenta")
+    table.add_column("Discovered", style="white")
+    table.add_column("Indexed", style="green")
+    table.add_column("Chunks", style="green")
+    table.add_column("Edges", style="green")
+    table.add_column("Error", style="red")
+
+    for j in jobs:
+        status_color = "green" if j["status"] == "completed" else ("red" if j["status"] == "failed" else "yellow")
+        table.add_row(
+            j["batch_id"],
+            j["court"],
+            str(j["year"]),
+            f"[{status_color}]{j['status'].upper()}[/{status_color}]",
+            str(j["docs_discovered"]),
+            str(j["docs_indexed"]),
+            str(j["chunks_created"]),
+            str(j["edges_created"]),
+            (j["error_message"][:30] + "...") if j.get("error_message") else "-",
+        )
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
 

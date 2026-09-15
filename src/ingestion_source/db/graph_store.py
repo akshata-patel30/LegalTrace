@@ -349,6 +349,194 @@ class FalkorGraphStore:
             })
         return common
 
+    def get_binding_authority_chain(self, doc_id: str) -> list[dict[str, Any]]:
+        """Find binding Supreme Court authorities for a judgment under Article 141 of the Constitution of India."""
+        result = self.graph.query(
+            """
+            MATCH (j:Judgment {doc_id: $doc_id})-[r:CITES]->(p:Precedent)
+            WHERE (
+                p.reporter = 'Supreme Court Cases (SCC)'
+                OR p.reporter = 'SCR'
+                OR p.reporter = 'AIR SC'
+                OR p.reporter CONTAINS 'Supreme Court'
+                OR toLower(p.canonical_citation) CONTAINS 'scc online sc'
+                OR toLower(p.canonical_citation) CONTAINS 'insc'
+                OR (toLower(p.canonical_citation) CONTAINS 'air' AND toLower(p.canonical_citation) CONTAINS 'sc')
+                OR (toLower(p.canonical_citation) CONTAINS 'scc' 
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'del' 
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'bom' 
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'mad' 
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'kar' 
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'cal'
+                    AND NOT toLower(p.canonical_citation) CONTAINS 'all')
+            )
+            RETURN p.canonical_citation AS canonical_citation,
+                   p.case_title AS case_title,
+                   p.reporter AS reporter,
+                   p.year AS year,
+                   r.treatment AS treatment,
+                   r.role AS rhetorical_role,
+                   r.context AS context,
+                   p.in_degree AS in_degree
+            ORDER BY p.year DESC, p.in_degree DESC
+            """,
+            {"doc_id": str(doc_id)},
+        )
+        chains = []
+        for row in result.result_set:
+            chains.append({
+                "canonical_citation": row[0],
+                "case_title": row[1] or "Supreme Court Landmark Precedent",
+                "reporter": row[2],
+                "year": row[3],
+                "treatment": row[4],
+                "rhetorical_role": row[5],
+                "context": row[6],
+                "in_degree": row[7],
+                "is_binding": True,
+                "binding_basis": "Article 141, Constitution of India (Law declared by Supreme Court is binding on all courts)",
+            })
+        return chains
+
+    def get_court_hierarchy_influence(self, court_slug: Optional[str] = None) -> dict[str, Any]:
+        """Analyze proportion of Supreme Court binding citations vs coordinate High Court citations."""
+        query = """
+        MATCH (j:Judgment)-[r:CITES]->(p:Precedent)
+        """
+        params = {}
+        if court_slug:
+            query += " WHERE toLower(j.court) CONTAINS toLower($court) "
+            params["court"] = court_slug
+
+        query += """
+        WITH p, r,
+             CASE
+                 WHEN p.reporter CONTAINS 'SCC' OR p.reporter CONTAINS 'SCR' OR p.reporter CONTAINS 'AIR SC' OR p.reporter CONTAINS 'INSC' OR toLower(p.canonical_citation) CONTAINS 'scc'
+                 THEN 'Supreme Court (Binding Art. 141)'
+                 WHEN p.reporter CONTAINS 'DHC' OR toLower(p.canonical_citation) CONTAINS 'dhc' OR toLower(p.canonical_citation) CONTAINS 'del'
+                 THEN 'Delhi High Court (Coordinate/Binding)'
+                 WHEN p.reporter CONTAINS 'Bom' OR toLower(p.canonical_citation) CONTAINS 'bom'
+                 THEN 'Bombay High Court (Persuasive)'
+                 WHEN p.reporter CONTAINS 'Mad' OR toLower(p.canonical_citation) CONTAINS 'mad'
+                 THEN 'Madras High Court (Persuasive)'
+                 WHEN p.reporter CONTAINS 'Kar' OR toLower(p.canonical_citation) CONTAINS 'kar'
+                 THEN 'Karnataka High Court (Persuasive)'
+                 ELSE 'Other High Courts / Authorities'
+             END AS jurisdiction_tier
+        RETURN jurisdiction_tier, count(r) AS edge_count
+        ORDER BY edge_count DESC
+        """
+        result = self.graph.query(query, params)
+        breakdown = {row[0]: row[1] for row in result.result_set}
+        total = sum(breakdown.values())
+        return {
+            "court_scope": court_slug or "All Courts",
+            "total_citations": total,
+            "hierarchy_breakdown": breakdown,
+        }
+
+    def ingest_edges_and_nodes(
+        self,
+        edges: Sequence[Any],
+        judgment_info: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        """Stream citation edges and precedent nodes into FalkorDB directly without file roundtrip."""
+        self.ensure_indexes()
+        judgments_created = 0
+        precedents_created = 0
+        edges_created = 0
+
+        # 1. Ingest Judgment node if info provided
+        if judgment_info:
+            doc_id = str(judgment_info.get("doc_id", ""))
+            if doc_id:
+                self.graph.query(
+                    """
+                    MERGE (j:Judgment {doc_id: $doc_id})
+                    SET j.title = $title,
+                        j.court = $court,
+                        j.year = $year,
+                        j.judge = $judge
+                    """,
+                    {
+                        "doc_id": doc_id,
+                        "title": str(judgment_info.get("title", "")),
+                        "court": str(judgment_info.get("court", "Unknown Court")),
+                        "year": int(judgment_info.get("year") or 2023),
+                        "judge": str(judgment_info.get("judge", "")),
+                    },
+                )
+                judgments_created += 1
+
+        # 2. Ingest Precedents and CITES edges
+        for edge in edges:
+            e_dict = edge.model_dump() if hasattr(edge, "model_dump") else (edge if isinstance(edge, dict) else vars(edge))
+
+            citing_doc_id = str(e_dict.get("citing_doc_id") or (judgment_info.get("doc_id") if judgment_info else ""))
+            raw_cit = str(e_dict.get("cited_citation") or "")
+            if not raw_cit or not citing_doc_id:
+                continue
+
+            prec_id = normalize_precedent_key(raw_cit)
+            cit_year = int(e_dict.get("cited_year") or 0)
+            reporter = str(e_dict.get("cited_reporter") or "Unknown")
+            case_title = str(e_dict.get("cited_title") or "")
+            treatment = str(e_dict.get("treatment") or "cited")
+            role = str(e_dict.get("rhetorical_role") or "precedents")
+            para_id = e_dict.get("citing_para_id")
+            context = str(e_dict.get("context_sentence") or "")[:500]
+            edge_id = str(e_dict.get("edge_id") or f"e_{citing_doc_id}_{prec_id}")
+
+            self.graph.query(
+                """
+                MERGE (p:Precedent {precedent_id: $pid})
+                ON CREATE SET p.canonical_citation = $cit,
+                              p.reporter = $reporter,
+                              p.year = $year,
+                              p.case_title = $title,
+                              p.in_degree = 1
+                ON MATCH SET p.in_degree = p.in_degree + 1
+                """,
+                {
+                    "pid": prec_id,
+                    "cit": raw_cit,
+                    "reporter": reporter,
+                    "year": cit_year,
+                    "title": case_title,
+                },
+            )
+            precedents_created += 1
+
+            self.graph.query(
+                """
+                MATCH (j:Judgment {doc_id: $doc_id}), (p:Precedent {precedent_id: $prec_id})
+                CREATE (j)-[:CITES {
+                    edge_id: $edge_id,
+                    treatment: $treatment,
+                    role: $role,
+                    para_id: $para_id,
+                    context: $context
+                }]->(p)
+                """,
+                {
+                    "doc_id": citing_doc_id,
+                    "prec_id": prec_id,
+                    "edge_id": edge_id,
+                    "treatment": treatment,
+                    "role": role,
+                    "para_id": para_id,
+                    "context": context,
+                },
+            )
+            edges_created += 1
+
+        self.save()
+        return {
+            "judgments_ingested": judgments_created,
+            "precedents_ingested": precedents_created,
+            "edges_created": edges_created,
+        }
+
     def get_graph_stats(self) -> dict[str, int]:
         """Return node and relationship cardinality statistics."""
         j_res = self.graph.query("MATCH (j:Judgment) RETURN count(j)")

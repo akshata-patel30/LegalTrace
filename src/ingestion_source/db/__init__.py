@@ -16,6 +16,7 @@ from ingestion_source.db.session import (
     init_db,
 )
 from ingestion_source.db.models import (
+    BatchIngestionJob,
     Chunk,
     Headnote,
     Judgment,
@@ -40,6 +41,7 @@ __all__ = [
     "StatuteMention",
     "SearchSession",
     "RAGSession",
+    "BatchIngestionJob",
     "QdrantVectorStore",
     "FalkorGraphStore",
 ]

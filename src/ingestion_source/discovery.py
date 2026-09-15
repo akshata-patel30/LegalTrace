@@ -19,16 +19,26 @@ logger = logging.getLogger(__name__)
 COURT_SLUG_MAP = {
     "delhi high court": "delhi",
     "delhi": "delhi",
+    "dhc": "delhi",
     "supreme court of india": "supremecourt",
     "supreme court": "supremecourt",
+    "sci": "supremecourt",
+    "sc": "supremecourt",
     "bombay high court": "bombay",
     "bombay": "bombay",
     "calcutta high court": "kolkata",
+    "kolkata": "kolkata",
     "madras high court": "chennai",
+    "madras": "chennai",
+    "chennai": "chennai",
     "karnataka high court": "karnataka",
+    "karnataka": "karnataka",
     "allahabad high court": "allahabad",
+    "allahabad": "allahabad",
     "kerala high court": "kerala",
+    "kerala": "kerala",
     "punjab and haryana high court": "punjab",
+    "punjab": "punjab",
 }
 
 
