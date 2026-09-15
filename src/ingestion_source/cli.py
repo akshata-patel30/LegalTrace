@@ -795,6 +795,7 @@ def headnote(
 def index_cmd(
     input_chunks: Path = typer.Option(Path("all_200_chunks.jsonl"), "--input", "-i", help="Path to chunks JSONL"),
     index_dir: Path = typer.Option(Path("search_index"), "--index-dir", help="Directory to save persistent index"),
+    embedder_type: str = typer.Option("dense", "--embedder", "-e", help="Embedder type: 'dense' or 'transformer'"),
 ) -> None:
     """Build persistent hybrid vector (dense + BM25) search index across legal chunks (Step 9 of Pipeline A)."""
     from ingestion_source.models import LegalChunk
@@ -806,18 +807,19 @@ def index_cmd(
 
     console.print(Panel(
         f"Building Hybrid Search Index (Dense Vectors + BM25 Lexical)\n"
-        f"Source: [bold cyan]{input_chunks}[/bold cyan] -> Index Dir: [bold]{index_dir}[/bold]",
+        f"Source: [bold cyan]{input_chunks}[/bold cyan] -> Index Dir: [bold]{index_dir}[/bold]\n"
+        f"Embedder Model: [bold yellow]{embedder_type}[/bold yellow]",
         style="blue",
     ))
 
-    with console.status("[bold green]Loading chunks and building dense + BM25 indices..."):
+    with console.status(f"[bold green]Loading chunks and building {embedder_type} vector + BM25 indices..."):
         chunks = []
         with open(input_chunks, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     chunks.append(LegalChunk(**json.loads(line)))
 
-        engine = HybridLegalSearchEngine(dim=384)
+        engine = HybridLegalSearchEngine(dim=384, embedder_type=embedder_type)
         engine.index_chunks(chunks)
         engine.save_index(index_dir)
 
@@ -826,6 +828,7 @@ def index_cmd(
     table.add_column("Value", style="cyan")
 
     table.add_row("Total Indexed Chunks", f"[bold green]{len(chunks):,}[/bold green]")
+    table.add_row("Embedding Engine", f"[bold yellow]{embedder_type.upper()}[/bold yellow]")
     table.add_row("Dense Embedding Dimension", "384")
     table.add_row("BM25 Unique Vocabulary Size", f"{len(engine.bm25.idf):,}")
     table.add_row("Average Document Token Length", f"{engine.bm25.avgdl:.1f} tokens")
@@ -1335,14 +1338,28 @@ def batch_ingest(
     console.print(table)
 
 
+def _run_async_command(coro):
+    """Run an async coroutine safely whether or not an event loop is currently active."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: asyncio.run(coro)).result()
+    return asyncio.run(coro)
+
+
 @app.command(name="batch-status")
 def batch_status() -> None:
     """Display progress and telemetry of all batch ingestion jobs stored in PostgreSQL."""
-    import asyncio
     from ingestion_source.batch_ingest import BatchIngestionOrchestrator
 
     orchestrator = BatchIngestionOrchestrator()
-    jobs = asyncio.run(orchestrator.get_all_batch_status())
+    jobs = _run_async_command(orchestrator.get_all_batch_status())
 
     if not jobs:
         console.print("[yellow]No batch ingestion jobs found in PostgreSQL database.[/yellow]")
@@ -1371,6 +1388,59 @@ def batch_status() -> None:
             str(j["chunks_created"]),
             str(j["edges_created"]),
             (j["error_message"][:30] + "...") if j.get("error_message") else "-",
+        )
+
+    console.print(table)
+
+
+@app.command(name="statute-lookup")
+def statute_lookup(
+    act: str = typer.Option(..., "--act", "-a", help="Act name or acronym (e.g. 'CrPC', 'IPC', 'Arbitration')"),
+    section: str = typer.Option(..., "--section", "-s", help="Section number (e.g. '482', '438', '34')"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Max ratio passages to return"),
+    store_dir: Path = typer.Option(Path("raw-store"), "--store-dir", "-d", help="Path to raw-store directory"),
+) -> None:
+    """Reverse lookup of judicial interpretations and ratio decidendi for a statute provision (Phase 4)."""
+    from ingestion_source.rag import StatuteRatioLookup
+
+    console.print(Panel(
+        f"Statute-to-Ratio Reverse Lookup\n"
+        f"Act: [bold cyan]{act}[/bold cyan] | Section: [bold yellow]{section}[/bold yellow]",
+        style="blue",
+    ))
+
+    lookup_engine = StatuteRatioLookup(raw_store_dir=store_dir)
+    with console.status(f"[bold green]Searching judicial decisions interpreting {act} Section {section}..."):
+        resp = _run_async_command(lookup_engine.lookup(act_name=act, section=section, top_k=limit))
+
+    console.print(f"[bold]Canonical Act:[/bold] [cyan]{resp.canonical_act}[/cyan]")
+    console.print(f"[bold]Total Judicial Rulings Found:[/bold] [green]{resp.total_results}[/green]\n")
+
+    if resp.key_principles:
+        console.print("[bold magenta]Synthesized Judicial Principles:[/bold magenta]")
+        for i, p in enumerate(resp.key_principles, 1):
+            console.print(f"  [bold yellow]{i}.[/bold yellow] {p}")
+        console.print()
+
+    if not resp.results:
+        console.print("[yellow]No judicial rulings found interpreting this specific section in corpus.[/yellow]")
+        return
+
+    table = Table(title=f"Judicial Decisions Interpreting {resp.canonical_act} Section {section}")
+    table.add_column("Doc ID", style="bold cyan")
+    table.add_column("Case Title", style="bold white")
+    table.add_column("Court / Year", style="yellow")
+    table.add_column("Role", style="magenta")
+    table.add_column("Ratio / Analysis Excerpt", style="white")
+
+    for r in resp.results:
+        excerpt = (r.ratio_text[:120] + "...") if len(r.ratio_text) > 120 else r.ratio_text
+        table.add_row(
+            r.doc_id,
+            r.case_title[:35],
+            f"{r.court} ({r.year})",
+            r.rhetorical_role.upper(),
+            excerpt,
         )
 
     console.print(table)

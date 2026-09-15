@@ -279,4 +279,50 @@ def test_cli_restructure(tmp_path: Path, mock_judgment_html: str):
     assert "Successfully cleaned doc_id=9999" in res_single.stdout
 
 
+def test_cli_statute_lookup():
+    """Verify CLI statute-lookup command executes and displays findings."""
+    res = runner.invoke(app, [
+        "statute-lookup",
+        "--act", "NDPS",
+        "--section", "37",
+        "--limit", "3",
+    ])
+    assert res.exit_code == 0
+    assert "Statute-to-Ratio Reverse Lookup" in res.stdout
+    assert "Narcotic Drugs and Psychotropic Substances Act, 1985" in res.stdout
+
+
+def test_cli_index_embedder_option(tmp_path: Path):
+    """Verify CLI index command accepts --embedder dense."""
+    chunks_file = tmp_path / "chunks.jsonl"
+    chunk_data = {
+        "chunk_id": "test_chunk_1",
+        "doc_id": "doc_1",
+        "chunk_index": 0,
+        "rhetorical_role": "analysis",
+        "text": "The high court has wide discretionary powers under Section 482.",
+        "text_with_context": "Delhi High Court. Analysis: Section 482 CrPC.",
+        "char_count": 60,
+        "word_count": 10,
+        "court": "Delhi High Court",
+        "court_slug": "delhi",
+        "year": 2023,
+        "case_title": "Test Case",
+        "statute_mentions": [],
+        "citations": [],
+    }
+    chunks_file.write_text(json.dumps(chunk_data) + "\n", encoding="utf-8")
+
+    index_dir = tmp_path / "search_index"
+    res = runner.invoke(app, [
+        "index",
+        "--input", str(chunks_file),
+        "--index-dir", str(index_dir),
+        "--embedder", "dense",
+    ])
+    assert res.exit_code == 0
+    assert "Index ready for high-speed hybrid search" in res.stdout
+    assert (index_dir / "dense_vectors.npy").exists()
+
+
 

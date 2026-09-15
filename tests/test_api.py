@@ -266,3 +266,42 @@ def test_batch_status_endpoint():
     data = response.json()
     assert isinstance(data, list)
 
+
+def test_graph_visualization_endpoint():
+    """Verify GET /api/graph/visualization/{doc_id} returns D3 node-link graph data."""
+    response = client.get("/api/graph/visualization/104774187?depth=2&limit=25")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["root_id"] == "104774187"
+    assert "nodes" in data
+    assert "links" in data
+    assert "stats" in data
+    assert len(data["nodes"]) >= 1
+    assert data["stats"]["total_nodes"] == len(data["nodes"])
+    assert data["stats"]["total_links"] == len(data["links"])
+
+
+def test_statute_lookup_endpoint_get():
+    """Verify GET /api/statutes/lookup returns reverse ratio interpretations."""
+    response = client.get("/api/statutes/lookup?act=NDPS&section=37&limit=5")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["act_name"] == "NDPS"
+    assert data["section"] == "37"
+    assert data["canonical_act"] == "Narcotic Drugs and Psychotropic Substances Act, 1985"
+    assert data["total_results"] >= 1
+    assert isinstance(data["key_principles"], list)
+    assert len(data["results"]) >= 1
+
+
+def test_statute_lookup_endpoint_post():
+    """Verify POST /api/statutes/ratio-lookup accepts structured JSON body."""
+    payload = {"act": "Arbitration Act", "section": "34", "limit": 3}
+    response = client.post("/api/statutes/ratio-lookup", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["canonical_act"] == "Arbitration and Conciliation Act, 1996"
+    assert data["section"] == "34"
+    assert "key_principles" in data
+    assert "results" in data
+

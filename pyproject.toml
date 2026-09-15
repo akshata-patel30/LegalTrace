@@ -32,6 +32,9 @@ dependencies = [
     "falkordb>=1.0.8",
     # Phase 1: RAG & LLM (Groq)
     "groq>=0.11.0",
+    # Phase 4: Advanced Legal AI (Transformer Embeddings)
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
 ]
 
 [project.optional-dependencies]

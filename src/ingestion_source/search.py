@@ -106,6 +106,75 @@ class DenseSemanticEmbedder:
         return matrix
 
 
+class TransformerSemanticEmbedder:
+    """Production-grade transformer semantic embedder (SentenceTransformers) with graceful fallback."""
+
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        dim: int = 384,
+        device: Optional[str] = None,
+    ) -> None:
+        self.model_name = model_name
+        self.dim = dim
+        self.device = device
+        self._model: Optional[Any] = None
+        self._fallback_embedder = DenseSemanticEmbedder(dim=dim)
+
+    def _load_model(self) -> Optional[Any]:
+        if self._model is not None:
+            return self._model
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self.model_name, device=self.device)
+            return self._model
+        except Exception as e:
+            logger.warning(
+                "Could not load SentenceTransformer model '%s' (%s). "
+                "Falling back to DenseSemanticEmbedder.",
+                self.model_name,
+                e,
+            )
+            return None
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """Embed a single text string into a normalized D-dimensional float32 vector."""
+        model = self._load_model()
+        if model is not None:
+            try:
+                vec = model.encode(text, normalize_embeddings=True)
+                if hasattr(vec, "detach"):
+                    vec = vec.detach().cpu().numpy()
+                vec = np.asarray(vec, dtype=np.float32)
+                if vec.ndim > 1:
+                    vec = vec.flatten()
+                return vec
+            except Exception as e:
+                logger.warning("Error encoding text with SentenceTransformer: %s", e)
+        return self._fallback_embedder.embed_text(text)
+
+    def embed_batch(self, texts: list[str]) -> np.ndarray:
+        """Embed a list of text strings into an (N, D) float32 matrix."""
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        model = self._load_model()
+        if model is not None:
+            try:
+                vecs = model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    batch_size=32,
+                    show_progress_bar=False,
+                )
+                if hasattr(vecs, "detach"):
+                    vecs = vecs.detach().cpu().numpy()
+                vecs = np.asarray(vecs, dtype=np.float32)
+                return vecs
+            except Exception as e:
+                logger.warning("Error batch encoding with SentenceTransformer: %s", e)
+        return self._fallback_embedder.embed_batch(texts)
+
+
 class BM25Searcher:
     """Okapi BM25 index with postings lists and inverse document frequency weighting."""
 
@@ -168,9 +237,19 @@ class BM25Searcher:
 class HybridLegalSearchEngine:
     """Full-featured Legal Search Engine combining dense vector similarity with BM25."""
 
-    def __init__(self, dim: int = 384) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        embedder: Optional[Any] = None,
+        embedder_type: str = "dense",
+    ) -> None:
         self.dim = dim
-        self.embedder = DenseSemanticEmbedder(dim=dim)
+        if embedder is not None:
+            self.embedder = embedder
+        elif embedder_type == "transformer":
+            self.embedder = TransformerSemanticEmbedder(dim=dim)
+        else:
+            self.embedder = DenseSemanticEmbedder(dim=dim)
         self.bm25 = BM25Searcher()
         self.chunks: list[dict[str, Any]] = []
         self.dense_matrix: Optional[np.ndarray] = None  # (N, D)

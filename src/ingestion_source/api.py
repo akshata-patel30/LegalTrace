@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -40,6 +41,9 @@ from ingestion_source.rag import (
     LegalShepardizer,
     QueryPlan,
     ShepardResult,
+    StatuteRatioLookup,
+    StatuteRatioResponse,
+    StatuteRatioResult,
 )
 from ingestion_source.search import HybridLegalSearchEngine
 
@@ -445,6 +449,178 @@ async def get_batch_status_api() -> list[dict[str, Any]]:
     return await orchestrator.get_all_batch_status()
 
 
+class StatuteRatioRequest(BaseModel):
+    act: str = Field(..., description="Statute or Act name/alias (e.g. 'CrPC', 'IPC', 'Arbitration Act')")
+    section: str = Field(..., description="Section number (e.g. '482', '438', '34')")
+    limit: int = Field(10, ge=1, le=50, description="Maximum ratio passages to return")
+
+
+@app.get("/api/graph/visualization/{doc_id}")
+def get_graph_visualization(
+    doc_id: str,
+    depth: int = Query(2, ge=1, le=5, description="Graph traversal depth"),
+    limit: int = Query(50, ge=5, le=200, description="Max nodes/links to return"),
+) -> dict[str, Any]:
+    """Return D3/Cytoscape-compatible node-link JSON for a judgment's citation neighborhood."""
+    store = get_graph_store()
+    nodes_map: dict[str, dict[str, Any]] = {}
+    links: list[dict[str, Any]] = []
+    treatment_counts: dict[str, int] = {}
+
+    # Attempt FalkorDB graph traversal
+    try:
+        query = (
+            "MATCH (j:Judgment {doc_id: $doc_id})-[r:CITES]->(p:Precedent) "
+            "RETURN j.doc_id AS citing_id, j.title AS citing_title, j.court AS citing_court, "
+            "       j.year AS citing_year, p.precedent_id AS cited_id, "
+            "       p.canonical_citation AS cited_citation, p.case_title AS cited_title, "
+            "       p.year AS cited_year, p.in_degree AS cited_in_degree, "
+            "       r.treatment AS treatment, r.role AS role, r.context AS context "
+            "LIMIT $limit"
+        )
+        res = store.graph.query(query, {"doc_id": doc_id, "limit": limit})
+        for row in getattr(res, "result_set", []):
+            citing_id = str(row[0])
+            citing_title = row[1] or f"Judgment {citing_id}"
+            citing_court = row[2] or "Delhi High Court"
+            citing_year = row[3] or 0
+            cited_id = str(row[4])
+            cited_citation = row[5] or cited_id
+            cited_title = row[6] or cited_citation
+            cited_year = row[7] or 0
+            cited_in_degree = row[8] or 1
+            treatment = row[9] or "cited"
+            role = row[10] or "precedents"
+            context = row[11] or ""
+
+            if citing_id not in nodes_map:
+                nodes_map[citing_id] = {
+                    "id": citing_id,
+                    "label": f"Doc {citing_id}",
+                    "title": citing_title,
+                    "type": "judgment",
+                    "court": citing_court,
+                    "year": citing_year,
+                    "group": 1,
+                }
+
+            if cited_id not in nodes_map:
+                nodes_map[cited_id] = {
+                    "id": cited_id,
+                    "label": cited_citation,
+                    "title": cited_title,
+                    "type": "precedent",
+                    "court": "Precedent Authority",
+                    "year": cited_year,
+                    "in_degree": cited_in_degree,
+                    "group": 2,
+                }
+
+            links.append({
+                "source": citing_id,
+                "target": cited_id,
+                "treatment": treatment,
+                "role": role,
+                "context": context[:250] if context else "",
+            })
+            treatment_counts[treatment] = treatment_counts.get(treatment, 0) + 1
+    except Exception as e:
+        logger.warning("FalkorDB query failed in get_graph_visualization: %s", e)
+
+    # Fallback to local files if nodes_map is empty
+    if not nodes_map:
+        if CITATION_EDGES_PATH.exists():
+            with open(CITATION_EDGES_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    edge = json.loads(line)
+                    if edge.get("citing_doc_id") == doc_id:
+                        citing_id = doc_id
+                        cited_cit = edge.get("cited_citation", "")
+                        clean = re.sub(r"[^\w\s]", " ", cited_cit)
+                        norm_key = "_".join(p.lower() for p in clean.split() if p)
+                        cited_id = f"prec_{norm_key}"
+                        treatment = edge.get("treatment", "cited")
+                        role = edge.get("rhetorical_role", "precedents")
+
+                        if citing_id not in nodes_map:
+                            nodes_map[citing_id] = {
+                                "id": citing_id,
+                                "label": f"Doc {citing_id}",
+                                "title": edge.get("citing_title") or f"Judgment {citing_id}",
+                                "type": "judgment",
+                                "court": edge.get("citing_court", "Delhi High Court"),
+                                "year": edge.get("citing_year", 2023),
+                                "group": 1,
+                            }
+                        if cited_id not in nodes_map:
+                            nodes_map[cited_id] = {
+                                "id": cited_id,
+                                "label": cited_cit,
+                                "title": edge.get("case_title") or cited_cit,
+                                "type": "precedent",
+                                "court": "Precedent Authority",
+                                "year": edge.get("citation_year", 0),
+                                "in_degree": 1,
+                                "group": 2,
+                            }
+                        links.append({
+                            "source": citing_id,
+                            "target": cited_id,
+                            "treatment": treatment,
+                            "role": role,
+                            "context": edge.get("context_sentence", "")[:250],
+                        })
+                        treatment_counts[treatment] = treatment_counts.get(treatment, 0) + 1
+                        if len(links) >= limit:
+                            break
+
+    # If still root node alone or empty, ensure root node exists
+    if doc_id not in nodes_map:
+        nodes_map[doc_id] = {
+            "id": doc_id,
+            "label": f"Doc {doc_id}",
+            "title": f"Judgment {doc_id}",
+            "type": "judgment",
+            "court": "Delhi High Court",
+            "year": 2023,
+            "group": 1,
+        }
+
+    return {
+        "root_id": doc_id,
+        "depth": depth,
+        "nodes": list(nodes_map.values()),
+        "links": links,
+        "stats": {
+            "total_nodes": len(nodes_map),
+            "total_links": len(links),
+            "treatment_breakdown": treatment_counts,
+        },
+    }
+
+
+@app.get("/api/statutes/lookup")
+async def statute_ratio_lookup_get(
+    act: str = Query(..., description="Act name or acronym, e.g. 'CrPC', 'IPC', 'Arbitration'"),
+    section: str = Query(..., description="Section number, e.g. '482', '34'"),
+    limit: int = Query(10, ge=1, le=50, description="Max results"),
+) -> dict[str, Any]:
+    """Reverse lookup of judicial interpretations and ratio decidendi for a statute provision."""
+    lookup_engine = StatuteRatioLookup(raw_store_dir=RAW_STORE_DIR)
+    resp = await lookup_engine.lookup(act_name=act, section=section, top_k=limit)
+    return resp.to_dict()
+
+
+@app.post("/api/statutes/ratio-lookup")
+async def statute_ratio_lookup_post(req: StatuteRatioRequest) -> dict[str, Any]:
+    """POST endpoint for statute-to-ratio reverse lookup with structured body."""
+    lookup_engine = StatuteRatioLookup(raw_store_dir=RAW_STORE_DIR)
+    resp = await lookup_engine.lookup(act_name=req.act, section=req.section, top_k=req.limit)
+    return resp.to_dict()
+
+
 # ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------
@@ -497,6 +673,9 @@ def serve_dashboard() -> str:
         </button>
         <button @click="tab = 'precedents'; loadPrecedents()" :class="tab === 'precedents' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-network-wired mr-1.5"></i>Citation Graph
+        </button>
+        <button @click="tab = 'statute'" :class="tab === 'statute' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-book-bookmark mr-1.5"></i>Statute Ratio
         </button>
         <button @click="tab = 'benchmark'; loadBenchmark()" :class="tab === 'benchmark' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-chart-line mr-1.5"></i>Benchmark QA
@@ -1047,6 +1226,102 @@ def serve_dashboard() -> str:
     <!-- TAB: CITATION GRAPH & LANDMARK PRECEDENTS -->
     <!-- ================================================================= -->
     <div x-show="tab === 'precedents'" x-cloak x-transition>
+      <!-- Interactive Neighborhood Visualizer Card -->
+      <div class="bg-slate-800/90 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <div class="flex flex-wrap items-center justify-between gap-4 mb-4">
+          <div>
+            <h3 class="text-base font-bold text-white flex items-center">
+              <i class="fa-solid fa-circle-nodes text-indigo-400 mr-2"></i>
+              Interactive Citation Graph Neighborhood Visualizer
+            </h3>
+            <p class="text-xs text-slate-400">Explore multi-hop citation paths and treatment relationships for any judgment in the corpus.</p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <input 
+              type="text" 
+              x-model="graphDocId" 
+              placeholder="Enter Document ID (e.g. 104774187)..." 
+              class="px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-white font-mono text-xs w-48"
+            />
+            <button 
+              @click="loadGraphVisualization()" 
+              :disabled="graphLoading"
+              class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow transition flex items-center"
+            >
+              <span x-show="!graphLoading"><i class="fa-solid fa-play mr-1"></i>Visualize</span>
+              <span x-show="graphLoading"><i class="fa-solid fa-spinner fa-spin mr-1"></i>Loading...</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Graph Metrics Bar -->
+        <div x-show="graphData" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
+            <div class="text-[10px] uppercase font-mono text-slate-400">Root Judgment</div>
+            <div class="text-sm font-bold text-white font-mono mt-0.5" x-text="graphData?.root_id"></div>
+          </div>
+          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
+            <div class="text-[10px] uppercase font-mono text-slate-400">Total Graph Nodes</div>
+            <div class="text-sm font-bold text-indigo-400 font-mono mt-0.5" x-text="graphData?.stats?.total_nodes || 0"></div>
+          </div>
+          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
+            <div class="text-[10px] uppercase font-mono text-slate-400">Citation Edges</div>
+            <div class="text-sm font-bold text-emerald-400 font-mono mt-0.5" x-text="graphData?.stats?.total_links || 0"></div>
+          </div>
+          <div class="bg-slate-900 p-3 rounded-lg border border-slate-800">
+            <div class="text-[10px] uppercase font-mono text-slate-400">Relied Upon Authorities</div>
+            <div class="text-sm font-bold text-cyan-400 font-mono mt-0.5" x-text="graphData?.stats?.treatment_breakdown?.relied_upon || 0"></div>
+          </div>
+        </div>
+
+        <!-- SVG Force Graph Canvas -->
+        <div x-show="graphData" class="bg-slate-950 rounded-xl border border-slate-800 p-4 relative overflow-hidden">
+          <svg class="w-full h-72 bg-slate-950" viewBox="0 0 800 300">
+            <!-- Draw Links -->
+            <template x-for="(link, lIdx) in (graphData?.links || [])" :key="'link-'+lIdx">
+              <line 
+                :x1="400" 
+                :y1="150" 
+                :x2="getGraphNodeX(lIdx, graphData.links.length)" 
+                :y2="getGraphNodeY(lIdx, graphData.links.length)" 
+                :stroke="getTreatmentStroke(link.treatment)" 
+                stroke-width="1.8" 
+                stroke-dasharray="3 2"
+              />
+            </template>
+
+            <!-- Center Root Node -->
+            <g transform="translate(400, 150)" class="cursor-pointer" @click="selectedGraphNode = graphData.nodes[0]">
+              <circle r="26" fill="#4f46e5" stroke="#818cf8" stroke-width="3" />
+              <text text-anchor="middle" dy="4" fill="#ffffff" font-size="10" font-family="monospace" font-weight="bold">ROOT</text>
+            </g>
+
+            <!-- Precedent Target Nodes -->
+            <template x-for="(link, lIdx) in (graphData?.links || [])" :key="'node-'+lIdx">
+              <g 
+                :transform="'translate(' + getGraphNodeX(lIdx, graphData.links.length) + ',' + getGraphNodeY(lIdx, graphData.links.length) + ')'" 
+                class="cursor-pointer transition hover:opacity-80"
+                @click="selectedGraphNode = getNodeById(link.target)"
+              >
+                <circle r="18" :fill="getTreatmentColor(link.treatment)" stroke="#ffffff" stroke-width="1.5" />
+                <text text-anchor="middle" dy="3" fill="#ffffff" font-size="8" font-family="monospace" font-weight="bold" x-text="'P' + (lIdx + 1)"></text>
+                <text text-anchor="middle" dy="28" fill="#94a3b8" font-size="9" font-family="monospace" x-text="(link.target || '').substring(0, 14)"></text>
+              </g>
+            </template>
+          </svg>
+
+          <!-- Selected Node Details Overlay -->
+          <div x-show="selectedGraphNode" class="mt-3 p-3 bg-slate-900/90 rounded-lg border border-slate-700 text-xs font-mono flex items-center justify-between">
+            <div>
+              <span class="text-slate-400">Selected Node: </span>
+              <span class="text-white font-bold" x-text="selectedGraphNode?.title || selectedGraphNode?.label"></span>
+              <span class="ml-2 px-2 py-0.5 rounded text-[10px]" :class="selectedGraphNode?.type === 'judgment' ? 'bg-indigo-950 text-indigo-300 border border-indigo-800' : 'bg-emerald-950 text-emerald-300 border border-emerald-800'" x-text="selectedGraphNode?.type?.toUpperCase()"></span>
+            </div>
+            <button @click="selectedGraphNode = null" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+          </div>
+        </div>
+      </div>
+
       <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl">
         <h2 class="text-base font-bold text-white mb-2 flex items-center">
           <i class="fa-solid fa-network-wired text-indigo-400 mr-2"></i>
@@ -1081,6 +1356,116 @@ def serve_dashboard() -> str:
               </template>
             </tbody>
           </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- TAB: STATUTE-TO-RATIO REVERSE LOOKUP -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'statute'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <h2 class="text-base font-bold text-white mb-2 flex items-center">
+          <i class="fa-solid fa-book-bookmark text-indigo-400 mr-2"></i>
+          Statute-to-Ratio Reverse Lookup Engine
+        </h2>
+        <p class="text-xs text-slate-400 mb-6">Given any Indian statutory provision (Act name + Section number), retrieves all judicial decisions, ratio decidendi passages, and synthesized legal doctrines interpreting that section.</p>
+
+        <form @submit.prevent="executeStatuteLookup">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Act / Statute Name or Acronym</label>
+              <input 
+                type="text" 
+                x-model="statuteAct" 
+                placeholder="e.g. 'CrPC', 'IPC', 'Arbitration Act'..."
+                class="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
+              />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1">Section Number</label>
+              <input 
+                type="text" 
+                x-model="statuteSection" 
+                placeholder="e.g. '482', '438', '34'..."
+                class="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
+              />
+            </div>
+            <div class="flex items-end">
+              <button 
+                type="submit" 
+                :disabled="statuteLoading"
+                class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-lg transition flex items-center justify-center"
+              >
+                <span x-show="!statuteLoading"><i class="fa-solid fa-magnifying-glass mr-1.5"></i>Search Ratio Decidendi</span>
+                <span x-show="statuteLoading"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i>Searching...</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <span>Quick samples:</span>
+            <button type="button" @click="statuteAct = 'CrPC'; statuteSection = '482'; executeStatuteLookup()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">Section 482 CrPC (Quashing)</button>
+            <button type="button" @click="statuteAct = 'Arbitration'; statuteSection = '34'; executeStatuteLookup()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">Section 34 Arbitration (Setting Aside)</button>
+            <button type="button" @click="statuteAct = 'IPC'; statuteSection = '302'; executeStatuteLookup()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">Section 302 IPC (Murder)</button>
+            <button type="button" @click="statuteAct = 'Constitution'; statuteSection = '226'; executeStatuteLookup()" class="px-2 py-1 bg-slate-700/60 hover:bg-slate-700 rounded text-slate-300 font-mono transition">Article 226 (Writ Jurisdiction)</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Results Stream -->
+      <div x-show="statuteResult" class="space-y-6">
+        <!-- Key Principles Summary -->
+        <div class="bg-slate-800/90 rounded-2xl p-6 border border-slate-700 shadow-xl">
+          <div class="flex items-center justify-between pb-4 border-b border-slate-700 mb-4">
+            <div>
+              <span class="text-xs font-mono text-indigo-400 uppercase tracking-wide">Synthesized Judicial Principles</span>
+              <h3 class="text-base font-bold text-white mt-0.5">
+                <span x-text="statuteResult?.canonical_act"></span> — Section <span x-text="statuteResult?.section"></span>
+              </h3>
+            </div>
+            <div class="text-right font-mono text-xs text-slate-400">
+              Found <span class="text-emerald-400 font-bold" x-text="statuteResult?.total_results || 0"></span> interpretations
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <template x-for="(principle, pIdx) in (statuteResult?.key_principles || [])" :key="'p-'+pIdx">
+              <div class="flex items-start space-x-3 p-3 bg-slate-900/80 rounded-xl border border-slate-800 text-xs text-slate-200 font-sans">
+                <i class="fa-solid fa-gavel text-indigo-400 mt-0.5"></i>
+                <span x-text="principle"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- Matching Judicial Passages -->
+        <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl space-y-4">
+          <h3 class="text-sm font-bold text-white mb-2 flex items-center">
+            <i class="fa-solid fa-scale-balanced text-indigo-400 mr-2"></i>
+            Judicial Decisions Interpreting Provision
+          </h3>
+
+          <div class="space-y-4">
+            <template x-for="(item, idx) in (statuteResult?.results || [])" :key="item.doc_id + '-' + idx">
+              <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 hover:border-slate-700 transition space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="font-bold text-xs text-white" x-text="item.case_title"></div>
+                  <div class="flex items-center space-x-2">
+                    <span class="px-2 py-0.5 rounded text-[10px] font-mono uppercase" :class="getRoleBadgeClass(item.rhetorical_role)" x-text="item.rhetorical_role"></span>
+                    <span class="text-[10px] font-mono text-slate-400" x-text="item.court + ' (' + item.year + ')'"></span>
+                  </div>
+                </div>
+
+                <p class="text-xs text-slate-300 font-serif leading-relaxed" x-text="item.ratio_text"></p>
+
+                <div x-show="item.headnote_ratio" class="mt-2 p-2.5 bg-slate-950 rounded-lg border border-slate-800 text-[11px] text-slate-400 font-mono">
+                  <span class="text-indigo-400 font-bold">Headnote Ratio: </span>
+                  <span x-text="item.headnote_ratio"></span>
+                </div>
+              </div>
+            </template>
+          </div>
         </div>
       </div>
     </div>
@@ -1388,13 +1773,104 @@ def serve_dashboard() -> str:
           return map[treatment] || 'bg-slate-800 text-slate-300';
         },
 
-        async loadPrecedents() {
-          if (this.precedents.length > 0) return;
+        // Graph Visualizer State
+        graphDocId: '104774187',
+        graphLoading: false,
+        graphData: null,
+        selectedGraphNode: null,
+
+        // Statute Ratio Lookup State
+        statuteAct: 'CrPC',
+        statuteSection: '482',
+        statuteLoading: false,
+        statuteResult: null,
+
+        async loadGraphVisualization() {
+          if (!this.graphDocId.trim()) return;
+          this.graphLoading = true;
           try {
-            const res = await fetch('/api/precedents/top?limit=25');
-            this.precedents = await res.json();
+            const res = await fetch('/api/graph/visualization/' + encodeURIComponent(this.graphDocId.trim()) + '?depth=2');
+            if (!res.ok) throw new Error('Failed to load citation graph');
+            this.graphData = await res.json();
           } catch (err) {
             console.error(err);
+            alert('Error loading citation graph: ' + err.message);
+          } finally {
+            this.graphLoading = false;
+          }
+        },
+
+        async executeStatuteLookup() {
+          if (!this.statuteAct.trim() || !this.statuteSection.trim()) return;
+          this.statuteLoading = true;
+          try {
+            const act = encodeURIComponent(this.statuteAct.trim());
+            const sec = encodeURIComponent(this.statuteSection.trim());
+            const res = await fetch('/api/statutes/lookup?act=' + act + '&section=' + sec + '&limit=10');
+            if (!res.ok) throw new Error('Statute lookup failed');
+            this.statuteResult = await res.json();
+          } catch (err) {
+            console.error(err);
+            alert('Error retrieving statute ratio: ' + err.message);
+          } finally {
+            this.statuteLoading = false;
+          }
+        },
+
+        getGraphNodeX(idx, total) {
+          if (total <= 0) return 400;
+          const angle = (idx / total) * 2 * Math.PI;
+          const radius = 110;
+          return Math.round(400 + radius * Math.cos(angle));
+        },
+
+        getGraphNodeY(idx, total) {
+          if (total <= 0) return 150;
+          const angle = (idx / total) * 2 * Math.PI;
+          const radius = 100;
+          return Math.round(150 + radius * Math.sin(angle));
+        },
+
+        getTreatmentStroke(treatment) {
+          const map = {
+            'relied_upon': '#10b981',
+            'followed': '#10b981',
+            'distinguished': '#f59e0b',
+            'overruled': '#f43f5e',
+            'caution': '#eab308',
+            'cited': '#6366f1'
+          };
+          return map[treatment] || '#64748b';
+        },
+
+        getTreatmentColor(treatment) {
+          const map = {
+            'relied_upon': '#059669',
+            'followed': '#059669',
+            'distinguished': '#d97706',
+            'overruled': '#e11d48',
+            'caution': '#ca8a04',
+            'cited': '#4f46e5'
+          };
+          return map[treatment] || '#475569';
+        },
+
+        getNodeById(id) {
+          if (!this.graphData || !this.graphData.nodes) return null;
+          return this.graphData.nodes.find(n => n.id === id) || { id: id, label: id, type: 'precedent' };
+        },
+
+        async loadPrecedents() {
+          if (this.precedents.length === 0) {
+            try {
+              const res = await fetch('/api/precedents/top?limit=25');
+              this.precedents = await res.json();
+            } catch (err) {
+              console.error(err);
+            }
+          }
+          if (!this.graphData) {
+            this.loadGraphVisualization();
           }
         },
 
