@@ -229,10 +229,10 @@ def test_shepardize_endpoint():
 
 def test_graph_neighbors_endpoint():
     """Verify GET /api/graph/neighbors/{node_id} returns graph adjacency."""
-    response = client.get("/api/graph/neighbors/888001")
+    response = client.get("/api/graph/neighbors/104774187")
     assert response.status_code == 200
     data = response.json()
-    assert data["node_id"] == "888001"
+    assert data["node_id"] == "104774187"
     assert "total_outgoing" in data
     assert data["total_outgoing"] >= 1
     assert "outgoing_citations" in data

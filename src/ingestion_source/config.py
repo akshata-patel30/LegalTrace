@@ -91,7 +91,7 @@ class Settings(BaseSettings):
 
     # PostgreSQL (async via asyncpg + SQLAlchemy 2.0)
     DATABASE_URL: str = Field(
-        default="postgresql+asyncpg://legaltrace:legaltrace_dev_2024@localhost:5432/legaltrace",
+        default="postgresql+asyncpg://legaltrace:legaltrace_dev_2024@localhost:5431/legaltrace",
         description="PostgreSQL async connection string",
     )
 

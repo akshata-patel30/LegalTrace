@@ -223,8 +223,19 @@ class FalkorGraphStore:
             "precedents_ingested": precedents_created,
             "edges_created": edges_created,
         }
-        logger.info("FalkorDB ingestion complete: %s", stats)
+        self.save()
+        logger.info("FalkorDB ingestion complete and snapshot saved: %s", stats)
         return stats
+
+    def save(self) -> bool:
+        """Persist graph and Redis state synchronously to disk (RDB / AOF)."""
+        try:
+            self.db.connection.save()
+            logger.info("Successfully persisted FalkorDB snapshot to disk via Redis SAVE.")
+            return True
+        except Exception as err:
+            logger.warning("FalkorDB SAVE returned warning/error: %s", err)
+            return False
 
     # ── Analytical and Shepardization Queries ──
 

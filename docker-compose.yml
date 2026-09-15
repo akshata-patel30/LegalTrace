@@ -12,7 +12,7 @@ services:
     container_name: legaltrace-postgres
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5431}:5432"
     environment:
       POSTGRES_DB: legaltrace
       POSTGRES_USER: legaltrace
@@ -46,7 +46,7 @@ services:
       QDRANT__SERVICE__HTTP_PORT: 6333
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -64,9 +64,9 @@ services:
       - "6379:6379"
       - "3000:3000"
     volumes:
-      - falkor_data:/data
+      - falkor_data:/var/lib/falkordb/data
     environment:
-      REDIS_ARGS: "--appendonly yes --maxmemory 512mb --maxmemory-policy noeviction"
+      REDIS_ARGS: "--appendonly yes --save 60 1 --save 300 10 --save 900 1000 --maxmemory 512mb --maxmemory-policy noeviction"
       FALKORDB_ARGS: "THREAD_COUNT 4 CACHE_SIZE 50"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

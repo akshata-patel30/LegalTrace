@@ -220,6 +220,16 @@ def test_cross_document_resolution_and_build_graph(tmp_path: Path):
     assert gml_out.exists()
 
     # Test CLI invocation
-    res = runner.invoke(app, ["graph", "--store-dir", str(tmp_path)])
+    res = runner.invoke(
+        app,
+        [
+            "graph",
+            "--store-dir", str(tmp_path),
+            "--output-edges", str(tmp_path / "cli_edges.jsonl"),
+            "--output-nodes", str(tmp_path / "cli_nodes.jsonl"),
+            "--output-graph", str(tmp_path / "cli_graph.json"),
+            "--output-graphml", str(tmp_path / "cli_graph.graphml"),
+        ],
+    )
     assert res.exit_code == 0
     assert "Precedent Citation Network Summary" in res.stdout
