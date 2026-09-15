@@ -1,0 +1,90 @@
+# LegalTrace Production Infrastructure
+# Usage: docker compose up -d
+# Tear down (keep data): docker compose down
+# Tear down (delete data): docker compose down -v
+
+services:
+  # ─────────────────────────────────────────────────────
+  # PostgreSQL 16 — Relational Core (Users, Metadata, Audit)
+  # ─────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: legaltrace-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: legaltrace
+      POSTGRES_USER: legaltrace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legaltrace_dev_2024}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legaltrace -d legaltrace"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - legaltrace-net
+
+  # ─────────────────────────────────────────────────────
+  # Qdrant v1.12 — Vector Search Engine (Dense + Sparse Hybrid)
+  # ─────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: legaltrace-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - legaltrace-net
+
+  # ─────────────────────────────────────────────────────
+  # FalkorDB — Graph Database (Precedent Citation Network)
+  # ─────────────────────────────────────────────────────
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: legaltrace-falkordb
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+      - "3000:3000"
+    volumes:
+      - falkor_data:/data
+    environment:
+      REDIS_ARGS: "--appendonly yes --maxmemory 512mb --maxmemory-policy noeviction"
+      FALKORDB_ARGS: "THREAD_COUNT 4 CACHE_SIZE 50"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - legaltrace-net
+
+volumes:
+  pg_data:
+    name: legaltrace-pg-data
+  qdrant_data:
+    name: legaltrace-qdrant-data
+  falkor_data:
+    name: legaltrace-falkor-data
+
+networks:
+  legaltrace-net:
+    name: legaltrace-network
+    driver: bridge

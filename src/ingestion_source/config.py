@@ -87,6 +87,29 @@ class Settings(BaseSettings):
     MAX_RETRIES: int = Field(default=3, description="Maximum retry attempts on transient network errors")
     BACKOFF_FACTOR: float = Field(default=2.0, description="Exponential backoff factor for retries")
 
+    # ─── Phase 2: Database Infrastructure ───
+
+    # PostgreSQL (async via asyncpg + SQLAlchemy 2.0)
+    DATABASE_URL: str = Field(
+        default="postgresql+asyncpg://legaltrace:legaltrace_dev_2024@localhost:5432/legaltrace",
+        description="PostgreSQL async connection string",
+    )
+
+    # Qdrant Vector Search
+    QDRANT_URL: str = Field(default="http://localhost:6333", description="Qdrant HTTP endpoint")
+    QDRANT_COLLECTION: str = Field(default="legal_chunks", description="Qdrant collection name")
+
+    # FalkorDB Citation Graph
+    FALKORDB_HOST: str = Field(default="localhost", description="FalkorDB host")
+    FALKORDB_PORT: int = Field(default=6379, description="FalkorDB Redis-compatible port")
+    FALKORDB_GRAPH: str = Field(default="citation_network", description="FalkorDB graph name")
+
+    # ─── Phase 1: RAG / LLM (Groq) ───
+
+    RAG_LLM_PROVIDER: str = Field(default="groq", description="LLM provider: groq | openai | ollama")
+    RAG_LLM_MODEL: str = Field(default="llama-3.1-70b-versatile", description="Groq model for RAG synthesis")
+    GROQ_API_KEY: Optional[str] = Field(default=None, description="Groq API key for LLM inference")
+
 
 def get_settings() -> Settings:
     """Retrieve application settings instance."""

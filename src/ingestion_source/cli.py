@@ -1022,6 +1022,58 @@ def serve_cmd(
     uvicorn.run(fastapi_app, host=host, port=port)
 
 
+@app.command(name="db-migrate")
+def db_migrate_cmd(
+    target: str = typer.Argument("all", help="Target database: all | postgres | qdrant | falkordb"),
+    db_url: Optional[str] = typer.Option(None, "--db-url", help="PostgreSQL connection string override"),
+    qdrant_url: Optional[str] = typer.Option(None, "--qdrant-url", help="Qdrant service URL override"),
+    falkor_host: Optional[str] = typer.Option(None, "--falkor-host", help="FalkorDB host override"),
+    falkor_port: Optional[int] = typer.Option(None, "--falkor-port", help="FalkorDB port override"),
+) -> None:
+    """Migrate Pipeline A artifacts into enterprise databases (PostgreSQL, Qdrant, FalkorDB)."""
+    import asyncio
+    from ingestion_source.config import get_settings
+    from ingestion_source.db.migrate import (
+        migrate_all,
+        migrate_falkordb,
+        migrate_postgres,
+        migrate_qdrant,
+    )
+
+    cfg = get_settings()
+    target_lower = target.lower().strip()
+
+    console.print(Panel(
+        f"[bold cyan]LegalTrace Database Infrastructure Migration (Phase 2)[/bold cyan]\n"
+        f"Target: [bold yellow]{target_lower.upper()}[/bold yellow]\n"
+        f"PostgreSQL: [dim]{db_url or cfg.DATABASE_URL}[/dim]\n"
+        f"Qdrant: [dim]{qdrant_url or cfg.QDRANT_URL}[/dim]\n"
+        f"FalkorDB: [dim]{falkor_host or cfg.FALKORDB_HOST}:{falkor_port or cfg.FALKORDB_PORT}[/dim]",
+        style="cyan",
+    ))
+
+    if target_lower == "all":
+        results = asyncio.run(migrate_all(cfg))
+        console.print("[bold green]Migration Summary:[/bold green]")
+        console.print_json(data=results)
+    elif target_lower in ("postgres", "pg"):
+        url = db_url or cfg.DATABASE_URL
+        stats = asyncio.run(migrate_postgres(db_url=url))
+        console.print(f"[bold green][OK] PostgreSQL populated:[/bold green] {stats}")
+    elif target_lower in ("qdrant", "vector"):
+        url = qdrant_url or cfg.QDRANT_URL
+        stats = migrate_qdrant(qdrant_url=url, collection_name=cfg.QDRANT_COLLECTION)
+        console.print(f"[bold green][OK] Qdrant populated:[/bold green] {stats}")
+    elif target_lower in ("falkordb", "falkor", "graph"):
+        host = falkor_host or cfg.FALKORDB_HOST
+        port = falkor_port or cfg.FALKORDB_PORT
+        stats = migrate_falkordb(host=host, port=port, graph_name=cfg.FALKORDB_GRAPH)
+        console.print(f"[bold green][OK] FalkorDB populated:[/bold green] {stats}")
+    else:
+        console.print(f"[bold red]Unknown migration target '{target}'. Choose from: all, postgres, qdrant, falkordb[/bold red]")
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
 

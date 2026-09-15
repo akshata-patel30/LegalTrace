@@ -24,6 +24,14 @@ dependencies = [
     "numpy>=2.0.0",
     "fastapi>=0.110.0",
     "uvicorn>=0.28.0",
+    # Phase 2: Database Infrastructure
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "qdrant-client>=1.12.0",
+    "falkordb>=1.0.8",
+    # Phase 1: RAG & LLM (Groq)
+    "groq>=0.11.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +40,8 @@ dev = [
     "pytest-cov>=5.0.0",
     "respx>=0.21.0",
     "pytest-mock>=3.14.0",
+    "pytest-asyncio>=0.23.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.scripts]
@@ -40,7 +50,11 @@ ingest = "ingestion_source.cli:app"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-v --strict-markers"
+addopts = "-v --strict-markers -p no:anyio"
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark test as asynchronous coroutine",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ingestion_source"]
