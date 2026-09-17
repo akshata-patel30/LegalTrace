@@ -647,6 +647,7 @@ def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
     refs = list(engine.discover_refs(
         courts=courts,
         years=years,
+        limit_per_target=req.limit,
         total_limit=req.limit,
         source_mode=req.source_mode,
         query=req.query,
@@ -671,7 +672,7 @@ def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
         orchestrator = JobOrchestrator(settings=settings)
         job_id = orchestrator.create_job(refs, mode=settings.MODE)
         report = orchestrator.execute_job(job_id=job_id, limit=len(refs), workers=1)
-        fetched_count = report.total_stored
+        fetched_count = getattr(report, "stored_count", 0)
 
     return {
         "status": "success",

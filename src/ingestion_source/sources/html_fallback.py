@@ -20,9 +20,21 @@ from ingestion_source.models import (
     SourceType,
 )
 from ingestion_source.rate_limiter import RobotsTxtManager, TokenBucketLimiter
+import asyncio
+import concurrent.futures
 import json
 
 logger = logging.getLogger(__name__)
+
+
+def _is_in_asyncio_loop() -> bool:
+    """Check if current execution context has an active or running asyncio event loop."""
+    try:
+        loop = asyncio.get_running_loop()
+        return loop is not None and loop.is_running()
+    except RuntimeError:
+        return False
+
 
 
 def parse_cookie_dict(raw_cookies: Optional[str]) -> dict[str, str]:
@@ -106,6 +118,7 @@ class IndianKanoonHTMLFallback:
             self.engine = getattr(self.settings, "SCRAPER_ENGINE", "scrapling")
 
         self._scrapling_session = None
+        self._scrapling_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._session_lock = threading.Lock()
 
         # Robots.txt compliance manager
@@ -162,42 +175,72 @@ class IndianKanoonHTMLFallback:
         self._owns_client = http_client is None
         self.last_access_control_encountered = False
 
-    def _get_scrapling_session(self):
-        """Lazy thread-safe initialization of Scrapling dynamic stealth browser session."""
+    def _run_in_scrapling_thread(self, func, *args, **kwargs):
+        """Execute a callable inside a dedicated single-threaded worker with an isolated event loop."""
+        def _target():
+            try:
+                import asyncio
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+            return func(*args, **kwargs)
+
         with self._session_lock:
-            if self._scrapling_session is None:
-                from scrapling.fetchers import StealthySession
+            if self._scrapling_executor is None:
+                self._scrapling_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="scrapling_worker",
+                )
+        return self._scrapling_executor.submit(_target).result()
 
-                logger.info("Initializing Scrapling dynamic stealth browser session...")
-                cookie_dict = parse_cookie_dict(self.settings.INDIANKANOON_COOKIES)
-                cookies = [
-                    {"name": k, "value": v, "domain": ".indiankanoon.org", "path": "/"}
-                    for k, v in cookie_dict.items()
-                ] if cookie_dict else None
+    def _init_scrapling_session(self):
+        """Must be executed inside the isolated Scrapling worker thread."""
+        if self._scrapling_session is None:
+            from scrapling.fetchers import StealthySession
 
-                session_kwargs = {
-                    "headless": True,
-                    "solve_cloudflare": True,
-                }
-                if cookies:
-                    session_kwargs["cookies"] = cookies
+            logger.info("Initializing Scrapling dynamic stealth browser session in isolated worker thread...")
+            cookie_dict = parse_cookie_dict(self.settings.INDIANKANOON_COOKIES)
+            cookies = [
+                {"name": k, "value": v, "domain": ".indiankanoon.org", "path": "/"}
+                for k, v in cookie_dict.items()
+            ] if cookie_dict else None
 
-                self._scrapling_session = StealthySession(**session_kwargs)
-                self._scrapling_session.start()
-            return self._scrapling_session
+            session_kwargs = {
+                "headless": True,
+                "solve_cloudflare": True,
+            }
+            if cookies:
+                session_kwargs["cookies"] = cookies
+
+            self._scrapling_session = StealthySession(**session_kwargs)
+            self._scrapling_session.start()
+        return self._scrapling_session
+
+    def _scrapling_fetch(self, url: str) -> tuple[int, str]:
+        """Fetch URL using Scrapling pinned to the isolated worker thread."""
+        def _fetch():
+            session = self._init_scrapling_session()
+            resp = session.fetch(url)
+            return resp.status, str(resp.html_content)
+
+        return self._run_in_scrapling_thread(_fetch)
 
     def _fetch_page(self, path_or_url: str) -> tuple[int, str]:
         """Fetch URL or relative path using the configured engine (scrapling or httpx)."""
         full_url = urljoin(self.base_url + "/", path_or_url.lstrip("/"))
+        rel_path = path_or_url if path_or_url.startswith("/") else f"/{path_or_url}"
+
         if self.engine == "scrapling":
-            session = self._get_scrapling_session()
-            with self._session_lock:
-                resp = session.fetch(full_url)
-            return resp.status, str(resp.html_content)
+            try:
+                return self._scrapling_fetch(full_url)
+            except Exception as e:
+                logger.warning("Scrapling fetch failed (%s). Falling back to HTTPX.", e)
+                resp = self._client.get(rel_path)
+                return resp.status_code, resp.text
         else:
-            rel_path = path_or_url if path_or_url.startswith("/") else f"/{path_or_url}"
             resp = self._client.get(rel_path)
             return resp.status_code, resp.text
+
 
     def get_source_type(self) -> SourceType:
         return SourceType.SCRAPE
@@ -377,11 +420,14 @@ class IndianKanoonHTMLFallback:
             soup = BeautifulSoup(text, "html.parser")
             batch_yielded = 0
 
-            # 1. Primary selector: <div class="result"> containers
-            results = soup.find_all("div", class_="result")
+            # 1. Primary selector: <article class="result"> or <div class="result"> containers
+            results = soup.find_all(["article", "div"], class_="result")
             if results:
                 for res in results:
-                    a_tag = res.find("a", href=re.compile(r"^/(?:doc|docfragment)/(\d+)/"))
+                    title_elem = res.find(class_="result_title")
+                    a_tag = title_elem.find("a") if title_elem else None
+                    if not a_tag:
+                        a_tag = res.find("a", href=re.compile(r"^/(?:doc|docfragment)/(\d+)/"))
                     if not a_tag:
                         continue
                     m = re.search(r"^/(?:doc|docfragment)/(\d+)/", a_tag.get("href", ""))
@@ -390,7 +436,7 @@ class IndianKanoonHTMLFallback:
                     doc_id = m.group(1)
                     title = a_tag.get_text(strip=True) or f"Document {doc_id}"
 
-                    headline_div = res.find("div", class_="headline")
+                    headline_div = res.find(class_="headline")
                     headline = headline_div.get_text(" ", strip=True) if headline_div else None
 
                     yield DocRef(
@@ -463,11 +509,13 @@ class IndianKanoonHTMLFallback:
         start_time = time.perf_counter()
         try:
             if self.engine == "scrapling":
-                session = self._get_scrapling_session()
-                with self._session_lock:
-                    resp = session.fetch(doc_url)
-                status_code = resp.status
-                html_content = str(resp.html_content)
+                try:
+                    status_code, html_content = self._scrapling_fetch(doc_url)
+                except Exception as e:
+                    logger.warning("Scrapling fetch failed for doc %s (%s). Falling back to HTTPX.", ref.doc_id, e)
+                    resp = self._client.get(doc_path)
+                    status_code = resp.status_code
+                    html_content = resp.text
             else:
                 resp = self._client.get(doc_path)
                 status_code = resp.status_code
@@ -635,10 +683,22 @@ class IndianKanoonHTMLFallback:
             except Exception:
                 pass
         with self._session_lock:
-            if self._scrapling_session is not None:
+            if self._scrapling_executor is not None:
+                def _close_session():
+                    if self._scrapling_session is not None:
+                        try:
+                            self._scrapling_session.close()
+                        except Exception as e:
+                            logger.debug("Error closing Scrapling session: %s", e)
+                        finally:
+                            self._scrapling_session = None
+
                 try:
-                    self._scrapling_session.close()
-                except Exception as e:
-                    logger.debug("Error closing Scrapling session: %s", e)
-                finally:
-                    self._scrapling_session = None
+                    self._scrapling_executor.submit(_close_session).result(timeout=10)
+                except Exception:
+                    pass
+                try:
+                    self._scrapling_executor.shutdown(wait=False)
+                except Exception:
+                    pass
+                self._scrapling_executor = None

@@ -110,20 +110,25 @@ class DiscoveryEngine:
             for year in target_years:
                 logger.info("Discovering judgments for court='%s' (%s), year=%d, query='%s'", court, slug, year, query or "")
                 target_yielded = 0
+                effective_target_limit = limit_per_target
+                if effective_target_limit is None and total_limit is not None:
+                    effective_target_limit = max(0, total_limit - yielded_total)
 
                 # Determine discovery strategy
                 if source_mode == "seed" or seed_file is not None:
-                    generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=limit_per_target, query=query)
+                    generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=effective_target_limit, query=query)
                 elif source_mode == "api":
-                    generator = self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query)
+                    generator = self._invoke_source_discover(source, court=court, year=year, limit=effective_target_limit, query=query)
                 elif source_mode == "scrape":
-                    generator = self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query)
+                    generator = self._invoke_source_discover(source, court=court, year=year, limit=effective_target_limit, query=query)
                 else:  # auto
                     # Attempt live discovery first
                     live_refs: list[DocRef] = []
                     try:
-                        for r in self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query):
+                        for r in self._invoke_source_discover(source, court=court, year=year, limit=effective_target_limit, query=query):
                             live_refs.append(r)
+                            if effective_target_limit and len(live_refs) >= effective_target_limit:
+                                break
                     except Exception as e:
                         logger.warning("Live discovery encountered error on court='%s', year=%d: %s", court, year, e)
 
@@ -137,7 +142,7 @@ class DiscoveryEngine:
                             slug,
                             year,
                         )
-                        generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=limit_per_target, query=query)
+                        generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=effective_target_limit, query=query)
 
                 for ref in generator:
                     if not ref.court_slug:
