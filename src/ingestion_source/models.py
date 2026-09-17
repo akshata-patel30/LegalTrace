@@ -50,6 +50,7 @@ class DocRef(BaseModel):
     title: Optional[str] = None
     source_url: str
     doctype: str = "judgment"
+    headline: Optional[str] = None
 
     @field_validator("court_slug", mode="before")
     @classmethod

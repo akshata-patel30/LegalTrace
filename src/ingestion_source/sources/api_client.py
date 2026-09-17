@@ -105,13 +105,20 @@ class IndianKanoonAPIClient:
         year: int,
         month: Optional[int] = None,
         limit: Optional[int] = None,
+        query: Optional[str] = None,
     ) -> Iterator[DocRef]:
-        """Discover judgments via API search matching court and year."""
-        # Convert court name to query term
+        """Discover judgments via API search matching court and year or keyword query."""
         court_query = court.lower().replace(" high court", "").replace("of india", "").strip()
-        query = f"doctypes:judgments court:{court_query} year:{year}"
-        if month:
-            query += f" month:{month}"
+        if query and query.strip():
+            search_query = query.strip()
+            if court_query and "court:" not in search_query.lower() and "doctypes:" not in search_query.lower():
+                search_query += f" court:{court_query}"
+            if year and "year:" not in search_query.lower():
+                search_query += f" year:{year}"
+        else:
+            search_query = f"doctypes:judgments court:{court_query} year:{year}"
+            if month:
+                search_query += f" month:{month}"
 
         page = 0
         yielded = 0
@@ -123,7 +130,7 @@ class IndianKanoonAPIClient:
                 logger.warning("Discovery stopped: %s", budget_err)
                 break
 
-            docs = self.search(query, pagenum=page)
+            docs = self.search(search_query, pagenum=page)
             if not docs:
                 break
 
@@ -135,6 +142,7 @@ class IndianKanoonAPIClient:
                 title = item.get("title", f"Document {tid}")
                 url = f"https://indiankanoon.org/doc/{tid}/"
                 doctype = item.get("doctype", "judgment")
+                headline = item.get("headline")
 
                 ref = DocRef(
                     doc_id=tid,
@@ -145,6 +153,7 @@ class IndianKanoonAPIClient:
                     title=title,
                     source_url=url,
                     doctype=doctype,
+                    headline=headline,
                 )
                 yield ref
                 yielded += 1

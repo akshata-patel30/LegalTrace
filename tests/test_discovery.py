@@ -96,3 +96,49 @@ def test_discovery_custom_seed_file(tmp_path: Path, sample_doc_ref: DocRef):
     assert len(loaded) == 1
     assert loaded[0].doc_id == sample_doc_ref.doc_id
 
+
+def test_discovery_with_query_passed_to_source():
+    received_query = {}
+
+    class QuerySource:
+        def discover(self, court: str, year: int, month=None, limit=None, query=None):
+            received_query["court"] = court
+            received_query["year"] = year
+            received_query["query"] = query
+            yield DocRef(
+                doc_id="888",
+                court=court,
+                year=year,
+                title="NDPS Judgment",
+                source_url="https://indiankanoon.org/doc/888/",
+                headline="Section 37 bail granted",
+            )
+
+    engine = DiscoveryEngine(source=QuerySource())
+    refs = list(engine.discover_refs(
+        courts=["Delhi High Court"],
+        years=[2023],
+        query="Section 37 NDPS",
+    ))
+
+    assert len(refs) == 1
+    assert refs[0].doc_id == "888"
+    assert received_query["query"] == "Section 37 NDPS"
+    assert refs[0].headline == "Section 37 bail granted"
+
+
+def test_seed_source_query_filtering():
+    from ingestion_source.sources.seed_source import SeedDocumentSource
+
+    seed_src = SeedDocumentSource()
+    # Search for "Kumar" among seed documents
+    refs_all = list(seed_src.discover(court="Delhi High Court", year=2023, limit=100))
+    refs_kumar = list(seed_src.discover(court="Delhi High Court", year=2023, limit=100, query="Kumar"))
+
+    assert len(refs_all) > len(refs_kumar)
+    assert len(refs_kumar) >= 1
+    for r in refs_kumar:
+        assert "kumar" in r.title.lower() or "kumar" in (r.headline or "").lower()
+
+
+

@@ -58,9 +58,11 @@ def discover(
     source: str = typer.Option("auto", "--source", "-s", help="Discovery source strategy (auto | scrape | api | seed)"),
     seed_file: Optional[Path] = typer.Option(None, "--seed-file", help="Optional path to custom seed manifest file"),
     cookies: Optional[str] = typer.Option(None, "--cookies", help="Optional custom cookies (e.g. session / clearance)"),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="Optional keyword or statutory search query (e.g. 'Section 37 NDPS bail')"),
 ) -> None:
     """Enumerate available judgments without downloading full text."""
-    console.print(Panel(f"Discovering judgments for [bold]{court}[/bold] (Year: {year})", style="blue"))
+    query_str = f" | Query: [bold]{query}[/bold]" if query else ""
+    console.print(Panel(f"Discovering judgments for [bold]{court}[/bold] (Year: {year}){query_str}", style="blue"))
     settings = get_settings()
     if cookies:
         settings.INDIANKANOON_COOKIES = cookies
@@ -75,6 +77,7 @@ def discover(
             limit=limit,
             source_mode=source,
             seed_file=seed_file,
+            query=query,
         )
 
     console.print(f"[bold green][OK] Successfully discovered {count} documents saved to {output}[/bold green]")
@@ -143,6 +146,7 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Number of concurrent worker threads"),
     delay: Optional[float] = typer.Option(None, "--delay", "-d", help="Delay in seconds between requests"),
     cookies: Optional[str] = typer.Option(None, "--cookies", help="Optional custom cookies (e.g. session / clearance)"),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="Optional keyword or statutory search query (e.g. 'Section 37 NDPS bail')"),
 ) -> None:
     """Convenience command: discover and fetch in a single multithreaded run."""
     settings = get_settings()
@@ -156,14 +160,15 @@ def run(
 
     engine = DiscoveryEngine(settings=settings)
 
+    query_line = f" | Query: [bold]{query}[/bold]" if query else ""
     console.print(Panel(
-        f"Automated Ingestion: [bold]{court}[/bold] ({year})\n"
+        f"Automated Ingestion: [bold]{court}[/bold] ({year}){query_line}\n"
         f"Mode: [bold]{mode}[/bold] | Workers: [bold]{workers}[/bold] | Target Limit: [bold]{limit}[/bold]",
         style="blue",
     ))
 
     with console.status("[bold green]Discovering document references..."):
-        refs = list(engine.discover_refs(courts=[court], years=[year], total_limit=limit))
+        refs = list(engine.discover_refs(courts=[court], years=[year], total_limit=limit, query=query))
 
     if not refs:
         console.print("[yellow]No document references found matching query.[/yellow]")

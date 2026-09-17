@@ -455,6 +455,16 @@ class StatuteRatioRequest(BaseModel):
     limit: int = Field(10, ge=1, le=50, description="Maximum ratio passages to return")
 
 
+class TargetedScrapeRequest(BaseModel):
+    query: str = Field(..., description="Targeted legal query or keywords (e.g. 'Section 37 NDPS commercial quantity bail')")
+    court: str = Field("Delhi High Court", description="Target court name (e.g. 'Delhi High Court')")
+    year: Optional[int] = Field(2023, description="Decision year (or None for all years)")
+    limit: int = Field(10, ge=1, le=50, description="Max candidate judgments to return")
+    source_mode: str = Field("auto", description="Discovery source mode: auto | seed | api | scrape")
+    auto_fetch: bool = Field(False, description="Whether to automatically download and store full text into raw-store")
+
+
+
 @app.get("/api/graph/visualization/{doc_id}")
 def get_graph_visualization(
     doc_id: str,
@@ -621,6 +631,61 @@ async def statute_ratio_lookup_post(req: StatuteRatioRequest) -> dict[str, Any]:
     return resp.to_dict()
 
 
+@app.post("/api/scrape/targeted")
+def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
+    """Execute targeted keyword/statute judgment discovery with optional full-text download."""
+    from ingestion_source.config import get_settings
+    from ingestion_source.discovery import DiscoveryEngine
+    from ingestion_source.job import JobOrchestrator
+
+    settings = get_settings()
+    engine = DiscoveryEngine(settings=settings)
+
+    courts = [req.court] if req.court else ["Delhi High Court"]
+    years = [req.year] if (req.year and req.year > 0) else None
+
+    refs = list(engine.discover_refs(
+        courts=courts,
+        years=years,
+        total_limit=req.limit,
+        source_mode=req.source_mode,
+        query=req.query,
+    ))
+
+    results_data = [
+        {
+            "doc_id": r.doc_id,
+            "title": r.title,
+            "court": r.court,
+            "year": r.year,
+            "source_url": r.source_url,
+            "headline": r.headline,
+            "month": r.month,
+        }
+        for r in refs
+    ]
+
+    fetched_count = 0
+    job_id = None
+    if req.auto_fetch and refs:
+        orchestrator = JobOrchestrator(settings=settings)
+        job_id = orchestrator.create_job(refs, mode=settings.MODE)
+        report = orchestrator.execute_job(job_id=job_id, limit=len(refs), workers=1)
+        fetched_count = report.total_stored
+
+    return {
+        "status": "success",
+        "query": req.query,
+        "court": req.court,
+        "year": req.year if (req.year and req.year > 0) else None,
+        "total_discovered": len(refs),
+        "auto_fetch": req.auto_fetch,
+        "fetched_count": fetched_count,
+        "job_id": job_id,
+        "results": results_data,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------
@@ -679,6 +744,9 @@ def serve_dashboard() -> str:
         </button>
         <button @click="tab = 'benchmark'; loadBenchmark()" :class="tab === 'benchmark' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-chart-line mr-1.5"></i>Benchmark QA
+        </button>
+        <button @click="tab = 'scrape'" :class="tab === 'scrape' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-cloud-arrow-down mr-1.5"></i>Keyword Scraper
         </button>
       </nav>
 
@@ -1511,6 +1579,177 @@ def serve_dashboard() -> str:
       </div>
     </div>
 
+    <!-- ================================================================= -->
+    <!-- TAB 8: TARGETED KEYWORD JUDGMENT SCRAPER -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'scrape'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h2 class="text-base font-bold text-white flex items-center">
+              <i class="fa-solid fa-bullseye text-indigo-400 mr-2"></i>
+              Targeted Judgment Scraper
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">
+              Scrape judgments filtered by specific keywords, sections, and legal doctrines directly from Indian Kanoon without crawling full court calendar indices.
+            </p>
+          </div>
+          <div class="hidden sm:flex items-center space-x-2 text-xs text-slate-400 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+            <i class="fa-solid fa-bolt text-amber-400"></i>
+            <span>Indian Kanoon Solr/Lucene Engine</span>
+          </div>
+        </div>
+
+        <!-- Query Form -->
+        <form @submit.prevent="executeTargetedScrape" class="space-y-4">
+          <div class="relative">
+            <i class="fa-solid fa-magnifying-glass absolute left-4 top-4 text-slate-400 text-lg"></i>
+            <input 
+              type="text" 
+              x-model="scrapeQuery" 
+              placeholder="Enter targeted legal keywords, sections, or case terms (e.g. 'Section 37 NDPS commercial quantity bail')..."
+              class="w-full pl-12 pr-32 py-3.5 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm shadow-inner"
+              required
+            />
+            <button 
+              type="submit" 
+              :disabled="scrapeLoading"
+              class="absolute right-2 top-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-md transition"
+            >
+              <span x-show="!scrapeLoading"><i class="fa-solid fa-satellite-dish mr-1.5"></i>Scrape Now</span>
+              <span x-show="scrapeLoading"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i>Scraping...</span>
+            </button>
+          </div>
+
+          <!-- Parameter Selectors -->
+          <div class="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+            <!-- Court Selector -->
+            <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+              <span class="text-slate-400 font-medium">Court:</span>
+              <select x-model="scrapeCourt" class="bg-transparent text-slate-200 focus:outline-none cursor-pointer">
+                <option value="Delhi High Court" class="bg-slate-800">Delhi High Court</option>
+                <option value="Supreme Court of India" class="bg-slate-800">Supreme Court of India</option>
+                <option value="Bombay High Court" class="bg-slate-800">Bombay High Court</option>
+                <option value="Calcutta High Court" class="bg-slate-800">Calcutta High Court</option>
+                <option value="Karnataka High Court" class="bg-slate-800">Karnataka High Court</option>
+              </select>
+            </div>
+
+            <!-- Year Selector -->
+            <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+              <span class="text-slate-400 font-medium">Year:</span>
+              <select x-model.number="scrapeYear" class="bg-transparent text-slate-200 focus:outline-none cursor-pointer">
+                <option value="2024" class="bg-slate-800">2024</option>
+                <option value="2023" class="bg-slate-800">2023</option>
+                <option value="2022" class="bg-slate-800">2022</option>
+                <option value="2021" class="bg-slate-800">2021</option>
+                <option value="2020" class="bg-slate-800">2020</option>
+                <option value="0" class="bg-slate-800">All Years (Unrestricted)</option>
+              </select>
+            </div>
+
+            <!-- Limit Selector -->
+            <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+              <span class="text-slate-400 font-medium">Max Limit:</span>
+              <select x-model.number="scrapeLimit" class="bg-transparent text-slate-200 focus:outline-none cursor-pointer">
+                <option value="5" class="bg-slate-800">5 judgments</option>
+                <option value="10" class="bg-slate-800">10 judgments</option>
+                <option value="20" class="bg-slate-800">20 judgments</option>
+                <option value="30" class="bg-slate-800">30 judgments</option>
+              </select>
+            </div>
+
+            <!-- Auto-Fetch Toggle -->
+            <label class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700 cursor-pointer">
+              <input type="checkbox" x-model="scrapeAutoFetch" class="rounded text-indigo-600 focus:ring-0">
+              <span :class="scrapeAutoFetch ? 'text-indigo-400 font-bold' : 'text-slate-400'">Auto-Download Full Text</span>
+            </label>
+          </div>
+
+          <!-- Quick Presets -->
+          <div class="flex items-center space-x-2 text-xs">
+            <span class="text-slate-500 font-medium">Quick Presets:</span>
+            <button type="button" @click="scrapeQuery = 'Section 37 NDPS commercial quantity bail'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">NDPS S.37 Bail</button>
+            <button type="button" @click="scrapeQuery = 'Section 34 Arbitration patent illegality'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">Arbitration S.34</button>
+            <button type="button" @click="scrapeQuery = 'Section 482 CrPC quashing FIR matrimonial dispute'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">S.482 Quashing</button>
+            <button type="button" @click="scrapeQuery = 'anticipatory bail PMLA Section 45'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">PMLA S.45 Bail</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Scrape Status & Telemetry Banner -->
+      <div x-show="scrapeData" class="mb-6 bg-slate-800/60 rounded-xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+          <div class="h-8 w-8 rounded-lg bg-indigo-900/60 border border-indigo-700 flex items-center justify-center text-indigo-400 font-bold">
+            <i class="fa-solid fa-list-check"></i>
+          </div>
+          <div>
+            <div class="text-xs font-bold text-white">
+              Targeted Discovery Completed: <span class="text-indigo-400" x-text="scrapeData?.total_discovered || 0"></span> judgments found
+            </div>
+            <div class="text-[11px] text-slate-400 font-mono">
+              Query: "<span x-text="scrapeData?.query"></span>" | Court: <span x-text="scrapeData?.court"></span> (<span x-text="scrapeData?.year || 'All'"></span>)
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4 text-xs font-mono">
+          <div x-show="scrapeData?.auto_fetch" class="px-2.5 py-1 rounded bg-emerald-950 text-emerald-300 border border-emerald-800">
+            <i class="fa-solid fa-download mr-1"></i>
+            Stored to Raw-Store: <span class="font-bold" x-text="scrapeData?.fetched_count || 0"></span>
+          </div>
+          <div class="text-slate-400">
+            Job ID: <span class="text-slate-200" x-text="scrapeData?.job_id || 'discovery_only'"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loading State -->
+      <div x-show="scrapeLoading" class="py-16 text-center">
+        <i class="fa-solid fa-circle-notch fa-spin text-4xl text-indigo-500 mb-4"></i>
+        <p class="text-sm font-medium text-slate-300">Connecting to Indian Kanoon Search Engine...</p>
+        <p class="text-xs text-slate-500 mt-1">Filtering court decisions by keyword & Lucene parameters with polite token bucket rate limiting.</p>
+      </div>
+
+      <!-- Results Grid -->
+      <div x-show="!scrapeLoading && scrapeData && scrapeData.results && scrapeData.results.length > 0" class="space-y-4">
+        <template x-for="item in (scrapeData?.results || [])" :key="item.doc_id">
+          <div class="p-5 bg-slate-800/80 rounded-2xl border border-slate-700 hover:border-slate-600 transition shadow-lg space-y-3">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div class="space-y-1">
+                <div class="flex items-center space-x-2">
+                  <span class="text-xs font-mono px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800 font-bold" x-text="'Doc #' + item.doc_id"></span>
+                  <span class="text-xs text-slate-400 font-mono" x-text="item.court + (item.year ? ' • ' + item.year : '')"></span>
+                </div>
+                <h3 class="text-sm font-bold text-white hover:text-indigo-300 transition" x-text="item.title"></h3>
+              </div>
+              <div class="flex items-center space-x-2">
+                <a :href="item.source_url" target="_blank" class="px-3 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition flex items-center space-x-1.5">
+                  <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+                  <span>Indian Kanoon</span>
+                </a>
+              </div>
+            </div>
+
+            <!-- Snippet / Headline if available -->
+            <div x-show="item.headline" class="p-3 bg-slate-950 rounded-xl border border-slate-800/80 text-xs text-slate-300 font-serif leading-relaxed">
+              <div class="text-[10px] font-mono text-indigo-400 uppercase tracking-wider mb-1 flex items-center">
+                <i class="fa-solid fa-highlighter mr-1"></i> SERP Keyword Context Snippet
+              </div>
+              <p x-html="item.headline"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Empty State -->
+      <div x-show="!scrapeLoading && scrapeData && (!scrapeData.results || scrapeData.results.length === 0)" class="py-16 text-center bg-slate-800/40 rounded-2xl border border-slate-700/60">
+        <i class="fa-solid fa-folder-open text-4xl text-slate-600 mb-3"></i>
+        <p class="text-sm text-slate-400 font-medium">No judgments found matching this keyword and court combination.</p>
+        <p class="text-xs text-slate-500 mt-1">Try broadening your search query or selecting "All Years".</p>
+      </div>
+    </div>
+
   </main>
 
   <!-- ================================================================= -->
@@ -1611,6 +1850,15 @@ def serve_dashboard() -> str:
         memoLoading: false,
         memoResult: null,
         copySuccess: false,
+
+        // Targeted Scraper State
+        scrapeQuery: 'Section 37 NDPS commercial quantity bail',
+        scrapeCourt: 'Delhi High Court',
+        scrapeYear: 2023,
+        scrapeLimit: 10,
+        scrapeAutoFetch: false,
+        scrapeLoading: false,
+        scrapeData: null,
 
         async init() {
           this.executeSearch();
@@ -1814,6 +2062,34 @@ def serve_dashboard() -> str:
             alert('Error retrieving statute ratio: ' + err.message);
           } finally {
             this.statuteLoading = false;
+          }
+        },
+
+        async executeTargetedScrape() {
+          if (!this.scrapeQuery.trim()) return;
+          this.scrapeLoading = true;
+          try {
+            const res = await fetch('/api/scrape/targeted', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query: this.scrapeQuery.trim(),
+                court: this.scrapeCourt,
+                year: this.scrapeYear ? parseInt(this.scrapeYear) : null,
+                limit: parseInt(this.scrapeLimit) || 10,
+                auto_fetch: !!this.scrapeAutoFetch
+              })
+            });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Scraping failed');
+            }
+            this.scrapeData = await res.json();
+          } catch (err) {
+            console.error(err);
+            alert('Error executing targeted scrape: ' + err.message);
+          } finally {
+            this.scrapeLoading = false;
           }
         },
 

@@ -325,4 +325,45 @@ def test_cli_index_embedder_option(tmp_path: Path):
     assert (index_dir / "dense_vectors.npy").exists()
 
 
+@respx.mock
+def test_cli_discover_with_query(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify CLI discover command with --query flag filters or targets judgments."""
+    monkeypatch.setenv("SCRAPER_ENGINE", "httpx")
+    monkeypatch.setenv("INTAKE_OUTPUT_PATH", str(tmp_path / "raw-store"))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "raw-store" / "job_state" / "test.sqlite"))
+
+    search_html = """
+    <html>
+    <body>
+      <div class="result">
+        <div class="result_title"><a href="/doc/998877/">State vs Ramesh Kumar (Section 37 NDPS)</a></div>
+        <div class="headline">Commercial quantity recovery was alleged under Section 37...</div>
+      </div>
+    </body>
+    </html>
+    """
+    respx.get("https://indiankanoon.org/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nAllow: /\n")
+    )
+    respx.get(url__regex=r"https://indiankanoon\.org/search/.*").mock(
+        return_value=httpx.Response(200, text=search_html)
+    )
+
+    out_file = tmp_path / "discovered_query.jsonl"
+    res = runner.invoke(app, [
+        "discover",
+        "--court", "Delhi High Court",
+        "--year", "2023",
+        "--limit", "3",
+        "--output", str(out_file),
+        "--query", "bail",
+    ])
+    assert res.exit_code == 0
+    assert "Successfully discovered 1 documents" in res.stdout
+    assert out_file.exists()
+
+
+
+
+
 

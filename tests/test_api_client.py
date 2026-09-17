@@ -95,3 +95,21 @@ def test_api_client_discovery(test_settings: Settings, mock_api_search_json: dic
     assert refs[0].doc_id == "1940428"
     assert refs[1].doc_id == "1940429"
     client.close()
+
+
+@respx.mock
+def test_api_client_discover_with_query(test_settings: Settings, mock_api_search_json: dict):
+    route = respx.post("https://api.indiankanoon.org/search/").mock(
+        return_value=httpx.Response(200, json=mock_api_search_json)
+    )
+
+    client = IndianKanoonAPIClient(settings=test_settings)
+    refs = list(client.discover(court="Delhi High Court", year=2023, limit=2, query="bail Section 37 NDPS"))
+
+    assert len(refs) == 2
+    assert route.called
+    req_url = str(route.calls.last.request.url)
+    assert "formInput" in req_url
+    assert "Section" in req_url
+    client.close()
+

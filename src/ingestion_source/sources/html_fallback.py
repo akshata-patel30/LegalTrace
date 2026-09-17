@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from typing import Iterator, Optional
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 from bs4 import BeautifulSoup
 import httpx
@@ -208,8 +208,18 @@ class IndianKanoonHTMLFallback:
         year: int,
         month: Optional[int] = None,
         limit: Optional[int] = None,
+        query: Optional[str] = None,
     ) -> Iterator[DocRef]:
-        """Discover documents by traversing the /browse/ hierarchy with month and pagination handling."""
+        """Discover documents by targeted keyword search or by traversing the /browse/ hierarchy."""
+        if query and query.strip():
+            yield from self._discover_by_search(
+                query=query.strip(),
+                court=court,
+                year=year,
+                limit=limit,
+            )
+            return
+
         court_slug = self._court_to_slug(court)
         base_browse_path = f"/browse/{court_slug}/{year}/"
         if month:
@@ -313,6 +323,124 @@ class IndianKanoonHTMLFallback:
 
         except Exception as e:
             logger.error("Error discovering documents on %s: %s", browse_url, e)
+
+    def _discover_by_search(
+        self,
+        query: str,
+        court: str,
+        year: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[DocRef]:
+        """Discover documents matching a keyword query via Indian Kanoon /search/?formInput=... endpoint."""
+        court_slug = self._court_to_slug(court)
+
+        # Build query string with native Indian Kanoon Lucene filters if not explicitly included
+        query_clean = query.strip()
+        parts = [query_clean]
+        if court_slug and "doctypes:" not in query_clean.lower():
+            parts.append(f"doctypes:{court_slug}")
+        if year and "fromdate:" not in query_clean.lower() and "todate:" not in query_clean.lower():
+            parts.append(f"fromdate:1-1-{year} todate:31-12-{year}")
+
+        full_query = " ".join(parts)
+        yielded = 0
+        current_page = 0
+        max_pages = min(50, ((limit // 10) + 2) if limit else 50)
+        self.last_access_control_encountered = False
+
+        while current_page < max_pages:
+            search_path = f"/search/?formInput={quote_plus(full_query)}"
+            if current_page > 0:
+                search_path += f"&pagenum={current_page}"
+
+            self.rate_limiter.acquire()
+            try:
+                status_code, text = self._fetch_page(search_path)
+            except Exception as e:
+                logger.error("Error fetching search page %s: %s", search_path, e)
+                break
+
+            if status_code in (401, 403) or "challenges.cloudflare.com" in text or "<title>Just a moment...</title>" in text:
+                logger.warning(
+                    "Search query '%s' returned status %d / Cloudflare challenge. Obeying access controls.",
+                    full_query,
+                    status_code,
+                )
+                self.rate_limiter.trigger_backoff()
+                self.last_access_control_encountered = True
+                return
+
+            if status_code != 200:
+                logger.warning("Search path %s returned status %d", search_path, status_code)
+                break
+
+            soup = BeautifulSoup(text, "html.parser")
+            batch_yielded = 0
+
+            # 1. Primary selector: <div class="result"> containers
+            results = soup.find_all("div", class_="result")
+            if results:
+                for res in results:
+                    a_tag = res.find("a", href=re.compile(r"^/(?:doc|docfragment)/(\d+)/"))
+                    if not a_tag:
+                        continue
+                    m = re.search(r"^/(?:doc|docfragment)/(\d+)/", a_tag.get("href", ""))
+                    if not m:
+                        continue
+                    doc_id = m.group(1)
+                    title = a_tag.get_text(strip=True) or f"Document {doc_id}"
+
+                    headline_div = res.find("div", class_="headline")
+                    headline = headline_div.get_text(" ", strip=True) if headline_div else None
+
+                    yield DocRef(
+                        doc_id=doc_id,
+                        court=court,
+                        court_slug=court_slug,
+                        year=year or 2023,
+                        title=title,
+                        source_url=f"{self.base_url}/doc/{doc_id}/",
+                        doctype="judgment",
+                        headline=headline,
+                    )
+                    yielded += 1
+                    batch_yielded += 1
+                    if limit and yielded >= limit:
+                        return
+            else:
+                # 2. Resilient fallback: Any /doc/(\d+)/ links on page
+                doc_links = soup.find_all("a", href=re.compile(r"^/doc/(\d+)/"))
+                seen_ids = set()
+                for link in doc_links:
+                    href = link.get("href", "")
+                    m = re.search(r"^/doc/(\d+)/", href)
+                    if not m:
+                        continue
+                    doc_id = m.group(1)
+                    if doc_id in seen_ids:
+                        continue
+                    seen_ids.add(doc_id)
+                    title = link.get_text(strip=True) or f"Document {doc_id}"
+
+                    yield DocRef(
+                        doc_id=doc_id,
+                        court=court,
+                        court_slug=court_slug,
+                        year=year or 2023,
+                        title=title,
+                        source_url=f"{self.base_url}/doc/{doc_id}/",
+                        doctype="judgment",
+                    )
+                    yielded += 1
+                    batch_yielded += 1
+                    if limit and yielded >= limit:
+                        return
+
+            # Indian Kanoon serves 10 results per page. If 0 or <10 returned, we reached end of results.
+            if batch_yielded == 0 or batch_yielded < 10:
+                break
+
+            current_page += 1
 
     def fetch(self, ref: DocRef) -> FetchResult:
         """Fetch raw HTML for a judgment with robots compliance, challenge detection, and drift guards."""

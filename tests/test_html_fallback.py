@@ -171,3 +171,38 @@ def test_html_fallback_cookie_jar_init(test_settings: Settings):
     scraper.close()
 
 
+@respx.mock
+def test_html_fallback_discover_by_search(test_settings: Settings, mock_robots_txt: str):
+    respx.get("https://indiankanoon.org/robots.txt").mock(
+        return_value=httpx.Response(200, text=mock_robots_txt)
+    )
+    search_html = """
+    <html>
+    <body>
+      <div class="result">
+        <div class="result_title"><a href="/doc/998877/">State vs Ramesh Kumar (Section 37 NDPS)</a></div>
+        <div class="headline">Commercial quantity recovery was alleged under Section 37...</div>
+      </div>
+      <div class="result">
+        <div class="result_title"><a href="/doc/998878/">Suresh vs Union of India</a></div>
+        <div class="headline">Bail granted under Section 37 NDPS Act...</div>
+      </div>
+    </body>
+    </html>
+    """
+    respx.get(url__regex=r"https://indiankanoon\.org/search/.*").mock(
+        return_value=httpx.Response(200, text=search_html)
+    )
+
+    scraper = IndianKanoonHTMLFallback(settings=test_settings)
+    refs = list(scraper.discover(court="Delhi High Court", year=2023, limit=2, query="Section 37 NDPS bail"))
+
+    assert len(refs) == 2
+    assert refs[0].doc_id == "998877"
+    assert refs[0].title == "State vs Ramesh Kumar (Section 37 NDPS)"
+    assert "Section 37" in (refs[0].headline or "")
+    assert refs[1].doc_id == "998878"
+    scraper.close()
+
+
+

@@ -44,8 +44,17 @@ class SeedDocumentSource:
         year: int,
         month: Optional[int] = None,
         limit: Optional[int] = None,
+        query: Optional[str] = None,
     ) -> Iterator[DocRef]:
         """Discover documents from custom seed file or built-in verified seed catalog."""
+        query_words = [w.lower() for w in query.split() if len(w) > 1] if query else []
+
+        def _matches_query(ref: DocRef) -> bool:
+            if not query_words:
+                return True
+            text_pool = f"{ref.title or ''} {ref.headline or ''}".lower()
+            return any(qw in text_pool for qw in query_words)
+
         # 1. Custom seed file if provided
         if self.custom_seed_file and self.custom_seed_file.exists():
             yielded = 0
@@ -57,19 +66,25 @@ class SeedDocumentSource:
                     try:
                         ref = DocRef(**json.loads(line))
                         if ref.year == year and (month is None or ref.month == month):
-                            yield ref
-                            yielded += 1
-                            if limit and yielded >= limit:
-                                return
+                            if _matches_query(ref):
+                                yield ref
+                                yielded += 1
+                                if limit and yielded >= limit:
+                                    return
                     except Exception as e:
                         logger.warning("Error reading line from seed file %s: %s", self.custom_seed_file, e)
             return
 
         # 2. Built-in verified seed catalog
         court_slug = self._court_to_slug(court)
-        seeds = get_seeds_for_court_and_year(court_slug=court_slug, year=year, month=month, limit=limit)
+        seeds = get_seeds_for_court_and_year(court_slug=court_slug, year=year, month=month, limit=None)
+        yielded = 0
         for ref in seeds:
-            yield ref
+            if _matches_query(ref):
+                yield ref
+                yielded += 1
+                if limit and yielded >= limit:
+                    return
 
     def fetch(self, ref: DocRef) -> FetchResult:
         """Fallback fetch for seed items if live fetch is unavailable."""

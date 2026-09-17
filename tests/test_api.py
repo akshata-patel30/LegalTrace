@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import httpx
 import pytest
+import respx
 from starlette.testclient import TestClient
 
 from ingestion_source.api import app
@@ -304,4 +306,43 @@ def test_statute_lookup_endpoint_post():
     assert data["section"] == "34"
     assert "key_principles" in data
     assert "results" in data
+
+
+def test_targeted_scrape_api_endpoint():
+    """Verify POST /api/scrape/targeted discovers keyword-specific judgments."""
+    payload = {
+        "query": "Kumar",
+        "court": "Delhi High Court",
+        "year": 2023,
+        "limit": 5,
+        "source_mode": "seed",
+        "auto_fetch": False,
+    }
+    response = client.post("/api/scrape/targeted", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert data["query"] == "Kumar"
+    assert data["court"] == "Delhi High Court"
+    assert data["year"] == 2023
+    assert data["total_discovered"] >= 1
+    assert "results" in data
+    assert len(data["results"]) >= 1
+    assert data["auto_fetch"] is False
+    assert data["fetched_count"] == 0
+    first = data["results"][0]
+    assert "doc_id" in first
+    assert "title" in first
+    assert "Kumar" in first["title"]
+
+
+def test_dashboard_contains_scraper_tab():
+    """Verify that root / includes Keyword Scraper tab and controls."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Keyword Scraper" in response.text
+    assert "Targeted Judgment Scraper" in response.text
+    assert "scrapeQuery" in response.text
+    assert "executeTargetedScrape" in response.text
+
 

@@ -17,8 +17,9 @@ class DocumentSource(Protocol):
         year: int,
         month: Optional[int] = None,
         limit: Optional[int] = None,
+        query: Optional[str] = None,
     ) -> Iterator[DocRef]:
-        """Discover document references from the source for a given court and time window."""
+        """Discover document references from the source for a given court, time window, or search query."""
         ...
 
     def fetch(self, ref: DocRef) -> FetchResult:

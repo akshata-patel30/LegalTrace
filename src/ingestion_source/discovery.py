@@ -71,6 +71,23 @@ class DiscoveryEngine:
             return IndianKanoonHTMLFallback(settings=self.settings)
         return IndianKanoonAPIClient(settings=self.settings)
 
+    @staticmethod
+    def _invoke_source_discover(
+        src: DocumentSource,
+        court: str,
+        year: int,
+        limit: Optional[int] = None,
+        query: Optional[str] = None,
+    ) -> Iterator[DocRef]:
+        """Safely invoke source.discover with parameter adaptation for backward compatibility."""
+        import inspect
+
+        kwargs = {"court": court, "year": year, "limit": limit, "query": query}
+        sig = inspect.signature(src.discover)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        filtered = {k: v for k, v in kwargs.items() if has_varkw or k in sig.parameters}
+        return src.discover(**filtered)
+
     def discover_refs(
         self,
         courts: Optional[Sequence[str]] = None,
@@ -79,8 +96,9 @@ class DiscoveryEngine:
         total_limit: Optional[int] = None,
         source_mode: str = "auto",
         seed_file: Optional[Path] = None,
+        query: Optional[str] = None,
     ) -> Iterator[DocRef]:
-        """Enumerate DocRefs across courts and years with ethical access-control fallbacks."""
+        """Enumerate DocRefs across courts, years, or search query with ethical access-control fallbacks."""
         target_courts = list(courts) if courts else self.settings.TARGET_COURTS
         target_years = list(years) if years else self.settings.TARGET_YEARS
         source = self._get_default_source()
@@ -90,21 +108,21 @@ class DiscoveryEngine:
         for court in target_courts:
             slug = normalize_court_slug(court)
             for year in target_years:
-                logger.info("Discovering judgments for court='%s' (%s), year=%d", court, slug, year)
+                logger.info("Discovering judgments for court='%s' (%s), year=%d, query='%s'", court, slug, year, query or "")
                 target_yielded = 0
 
                 # Determine discovery strategy
                 if source_mode == "seed" or seed_file is not None:
-                    generator = seed_source.discover(court=court, year=year, limit=limit_per_target)
+                    generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=limit_per_target, query=query)
                 elif source_mode == "api":
-                    generator = source.discover(court=court, year=year, limit=limit_per_target)
+                    generator = self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query)
                 elif source_mode == "scrape":
-                    generator = source.discover(court=court, year=year, limit=limit_per_target)
+                    generator = self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query)
                 else:  # auto
                     # Attempt live discovery first
                     live_refs: list[DocRef] = []
                     try:
-                        for r in source.discover(court=court, year=year, limit=limit_per_target):
+                        for r in self._invoke_source_discover(source, court=court, year=year, limit=limit_per_target, query=query):
                             live_refs.append(r)
                     except Exception as e:
                         logger.warning("Live discovery encountered error on court='%s', year=%d: %s", court, year, e)
@@ -119,7 +137,7 @@ class DiscoveryEngine:
                             slug,
                             year,
                         )
-                        generator = seed_source.discover(court=court, year=year, limit=limit_per_target)
+                        generator = self._invoke_source_discover(seed_source, court=court, year=year, limit=limit_per_target, query=query)
 
                 for ref in generator:
                     if not ref.court_slug:
@@ -141,6 +159,7 @@ class DiscoveryEngine:
         limit: Optional[int] = None,
         source_mode: str = "auto",
         seed_file: Optional[Path] = None,
+        query: Optional[str] = None,
     ) -> int:
         """Discover and save doc references to a JSONL file."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +171,7 @@ class DiscoveryEngine:
                 total_limit=limit,
                 source_mode=source_mode,
                 seed_file=seed_file,
+                query=query,
             ):
                 f.write(ref.model_dump_json() + "\n")
                 count += 1
