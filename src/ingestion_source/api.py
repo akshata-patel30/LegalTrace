@@ -1857,6 +1857,8 @@ def serve_dashboard() -> str:
               </div>
               <p x-html="item.headline"></p>
             </div>
+          </div>
+        </template>
       </div>
 
       <!-- Empty State -->
