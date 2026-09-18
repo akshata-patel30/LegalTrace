@@ -668,11 +668,31 @@ def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
 
     fetched_count = 0
     job_id = None
+    indexed_chunks_count = 0
     if req.auto_fetch and refs:
         orchestrator = JobOrchestrator(settings=settings)
         job_id = orchestrator.create_job(refs, mode=settings.MODE)
         report = orchestrator.execute_job(job_id=job_id, limit=len(refs), workers=1)
         fetched_count = getattr(report, "stored_count", 0)
+
+        # ─── Downstream Automatic Pipeline B: Clean, Enrich, Chunk, Headnote & Live Search Indexing ───
+        try:
+            from ingestion_source.pipeline_processor import process_and_index_scraped_documents
+            engine_inst = None
+            try:
+                engine_inst = get_engine()
+            except Exception as e:
+                logger.warning("Search engine could not be acquired for auto-indexing: %s", e)
+
+            proc_stats = process_and_index_scraped_documents(
+                doc_refs=refs,
+                settings=settings,
+                search_engine=engine_inst,
+                index_dir=INDEX_DIR,
+            )
+            indexed_chunks_count = proc_stats.get("indexed_chunks", 0)
+        except Exception as e:
+            logger.warning("Downstream pipeline processing failed: %s", e)
 
     return {
         "status": "success",
@@ -682,6 +702,7 @@ def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
         "total_discovered": len(refs),
         "auto_fetch": req.auto_fetch,
         "fetched_count": fetched_count,
+        "indexed_chunks_count": indexed_chunks_count,
         "job_id": job_id,
         "results": results_data,
     }
@@ -1699,6 +1720,10 @@ def serve_dashboard() -> str:
             <i class="fa-solid fa-download mr-1"></i>
             Stored to Raw-Store: <span class="font-bold" x-text="scrapeData?.fetched_count || 0"></span>
           </div>
+          <div x-show="scrapeData?.indexed_chunks_count" class="px-2.5 py-1 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">
+            <i class="fa-solid fa-bolt mr-1"></i>
+            Indexed to Search: <span class="font-bold" x-text="scrapeData?.indexed_chunks_count || 0"></span> chunks
+          </div>
           <div class="text-slate-400">
             Job ID: <span class="text-slate-200" x-text="scrapeData?.job_id || 'discovery_only'"></span>
           </div>
@@ -2086,6 +2111,9 @@ def serve_dashboard() -> str:
               throw new Error(err.detail || 'Scraping failed');
             }
             this.scrapeData = await res.json();
+            if (this.scrapeData && this.scrapeData.indexed_chunks_count) {
+              this.totalIndexed = (this.totalIndexed || 0) + this.scrapeData.indexed_chunks_count;
+            }
           } catch (err) {
             console.error(err);
             alert('Error executing targeted scrape: ' + err.message);

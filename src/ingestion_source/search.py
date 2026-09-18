@@ -198,7 +198,7 @@ class BM25Searcher:
         self.avgdl = float(np.mean(self.doc_len)) if self.corpus_size > 0 else 0.0
 
         doc_frequencies: dict[str, int] = Counter()
-        self.inverted_index.clear()
+        self.inverted_index = defaultdict(list)
 
         for doc_idx, doc in enumerate(tokenized_docs):
             term_counts = Counter(doc)
@@ -288,6 +288,48 @@ class HybridLegalSearchEngine:
 
         elapsed = (time.perf_counter() - t0) * 1000.0
         logger.info("Indexed %d chunks in %.1f ms", len(chunks), elapsed)
+
+    def add_chunks(self, chunks: list[LegalChunk]) -> int:
+        """Incrementally append new chunks to the search index and re-sync vectors and BM25."""
+        if not chunks:
+            return 0
+
+        existing_ids = {c["chunk_id"] for c in self.chunks}
+        unique_chunks = [c for c in chunks if c.chunk_id not in existing_ids]
+        if not unique_chunks:
+            return 0
+
+        new_chunk_dicts = []
+        new_texts_for_embedding = []
+        for c in unique_chunks:
+            new_chunk_dicts.append({
+                "chunk_id": c.chunk_id,
+                "doc_id": c.doc_id,
+                "court": c.court,
+                "year": c.year,
+                "case_title": c.case_title,
+                "rhetorical_role": c.rhetorical_role.value if hasattr(c.rhetorical_role, "value") else str(c.rhetorical_role),
+                "text": c.text,
+                "text_with_context": c.text_with_context,
+                "statute_mentions": c.statute_mentions,
+                "citations": c.citations,
+            })
+            new_texts_for_embedding.append(c.text_with_context or c.text)
+
+        new_vectors = self.embedder.embed_batch(new_texts_for_embedding)
+
+        if self.dense_matrix is None or len(self.chunks) == 0:
+            self.dense_matrix = new_vectors
+        else:
+            self.dense_matrix = np.vstack([self.dense_matrix, new_vectors])
+
+        self.chunks.extend(new_chunk_dicts)
+
+        all_tokenized = [tokenize(c.get("text_with_context") or c.get("text", "")) for c in self.chunks]
+        self.bm25.fit(all_tokenized)
+
+        logger.info("Added %d new chunks to live index. Total now: %d", len(unique_chunks), len(self.chunks))
+        return len(unique_chunks)
 
     def search(
         self,
@@ -444,6 +486,6 @@ class HybridLegalSearchEngine:
         self.bm25.avgdl = bm25_data["avgdl"]
         self.bm25.idf = bm25_data["idf"]
         self.bm25.doc_len = np.array(bm25_data["doc_len"], dtype=np.float32)
-        self.bm25.inverted_index = {k: [(item[0], item[1]) for item in v] for k, v in bm25_data["inverted_index"].items()}
+        self.bm25.inverted_index = defaultdict(list, {k: [(item[0], item[1]) for item in v] for k, v in bm25_data["inverted_index"].items()})
 
         logger.info("Loaded hybrid search index from %s (%d chunks)", index_dir, len(self.chunks))
