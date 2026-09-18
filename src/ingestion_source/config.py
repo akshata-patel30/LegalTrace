@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     # ─── Phase 1: RAG / LLM (Groq) ───
 
     RAG_LLM_PROVIDER: str = Field(default="groq", description="LLM provider: groq | openai | ollama")
-    RAG_LLM_MODEL: str = Field(default="llama-3.1-70b-versatile", description="Groq model for RAG synthesis")
+    RAG_LLM_MODEL: str = Field(default="qwen/qwen3.8-27b", description="Groq model for RAG synthesis")
     GROQ_API_KEY: Optional[str] = Field(default=None, description="Groq API key for LLM inference")
 
 

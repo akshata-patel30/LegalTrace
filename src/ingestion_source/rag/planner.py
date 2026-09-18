@@ -289,7 +289,7 @@ class LegalQueryPlanner:
         )
 
         response = client.chat.completions.create(
-            model=self.settings.RAG_LLM_MODEL or "llama-3.1-70b-versatile",
+            model=self.settings.RAG_LLM_MODEL or "qwen/qwen3.8-27b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Decompose this legal question:\n{query}"},

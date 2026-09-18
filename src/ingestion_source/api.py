@@ -708,6 +708,68 @@ def targeted_scrape_api(req: TargetedScrapeRequest) -> dict[str, Any]:
     }
 
 
+class DownloadAndIndexRequest(BaseModel):
+    doc_id: str
+    court: str = Field("Delhi High Court", description="Court name")
+    year: Optional[int] = Field(2023, description="Decision year")
+    title: Optional[str] = Field(None, description="Case title")
+    source_url: Optional[str] = Field(None, description="Source URL")
+
+
+@app.post("/api/scrape/download-and-index")
+def download_and_index_single_judgment(req: DownloadAndIndexRequest) -> dict[str, Any]:
+    """Download a single discovered judgment, run downstream processing, and index into search/RAG."""
+    from ingestion_source.config import get_settings
+    from ingestion_source.job import JobOrchestrator
+    from ingestion_source.models import DocRef
+    from ingestion_source.pipeline_processor import process_and_index_scraped_documents
+
+    settings = get_settings()
+    ref = DocRef(
+        doc_id=req.doc_id,
+        court=req.court,
+        year=req.year or 2023,
+        title=req.title or f"Judgment {req.doc_id}",
+        source_url=req.source_url or f"https://indiankanoon.org/doc/{req.doc_id}/",
+    )
+    orchestrator = JobOrchestrator(settings=settings)
+    job_id = orchestrator.create_job([ref], mode=settings.MODE)
+    report = orchestrator.execute_job(job_id=job_id, limit=1, workers=1)
+    stored_count = getattr(report, "stored_count", 0)
+
+    engine_inst = None
+    try:
+        engine_inst = get_engine()
+    except Exception as e:
+        logger.warning("Search engine could not be acquired for auto-indexing: %s", e)
+
+    proc_stats = process_and_index_scraped_documents(
+        doc_refs=[ref],
+        settings=settings,
+        search_engine=engine_inst,
+        index_dir=INDEX_DIR,
+    )
+
+    return {
+        "status": "success",
+        "doc_id": req.doc_id,
+        "title": ref.title,
+        "stored": stored_count > 0,
+        "indexed_chunks": proc_stats.get("indexed_chunks", 0),
+        "headnotes_count": proc_stats.get("headnotes_count", 0),
+    }
+
+
+@app.get("/api/scrape/indexed-doc-ids")
+def get_indexed_doc_ids() -> list[str]:
+    """Return list of all doc_ids currently present in the search index."""
+    try:
+        eng = get_engine()
+        return list({str(c.get("doc_id")) for c in eng.chunks if c.get("doc_id")})
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------
@@ -1674,17 +1736,17 @@ def serve_dashboard() -> str:
             <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
               <span class="text-slate-400 font-medium">Max Limit:</span>
               <select x-model.number="scrapeLimit" class="bg-transparent text-slate-200 focus:outline-none cursor-pointer">
-                <option value="5" class="bg-slate-800">5 judgments</option>
-                <option value="10" class="bg-slate-800">10 judgments</option>
-                <option value="20" class="bg-slate-800">20 judgments</option>
-                <option value="30" class="bg-slate-800">30 judgments</option>
+                <option value="2">2 judgments (Fastest)</option>
+                <option value="3" selected>3 judgments (Recommended)</option>
+                <option value="5">5 judgments</option>
+                <option value="10">10 judgments</option>
               </select>
             </div>
 
             <!-- Auto-Fetch Toggle -->
-            <label class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700 cursor-pointer">
+            <label class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700 cursor-pointer" title="Automatically download full text, extract rhetorical roles, and index into RAG vector engine">
               <input type="checkbox" x-model="scrapeAutoFetch" class="rounded text-indigo-600 focus:ring-0">
-              <span :class="scrapeAutoFetch ? 'text-indigo-400 font-bold' : 'text-slate-400'">Auto-Download Full Text</span>
+              <span :class="scrapeAutoFetch ? 'text-emerald-400 font-bold' : 'text-slate-400'"><i class="fa-solid fa-bolt mr-1 text-amber-400"></i>Auto-Download & Index to RAG</span>
             </label>
           </div>
 
@@ -1695,6 +1757,7 @@ def serve_dashboard() -> str:
             <button type="button" @click="scrapeQuery = 'Section 34 Arbitration patent illegality'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">Arbitration S.34</button>
             <button type="button" @click="scrapeQuery = 'Section 482 CrPC quashing FIR matrimonial dispute'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">S.482 Quashing</button>
             <button type="button" @click="scrapeQuery = 'anticipatory bail PMLA Section 45'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">PMLA S.45 Bail</button>
+            <button type="button" @click="scrapeQuery = 'Article 15(3) Domestic Violence Act protection'" class="px-2 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition">Domestic Violence Art.15(3)</button>
           </div>
         </form>
       </div>
@@ -1733,8 +1796,9 @@ def serve_dashboard() -> str:
       <!-- Loading State -->
       <div x-show="scrapeLoading" class="py-16 text-center">
         <i class="fa-solid fa-circle-notch fa-spin text-4xl text-indigo-500 mb-4"></i>
-        <p class="text-sm font-medium text-slate-300">Connecting to Indian Kanoon Search Engine...</p>
-        <p class="text-xs text-slate-500 mt-1">Filtering court decisions by keyword & Lucene parameters with polite token bucket rate limiting.</p>
+        <p class="text-sm font-medium text-slate-300">Connecting to Indian Kanoon & Processing...</p>
+        <p class="text-xs text-slate-500 mt-1" x-show="scrapeAutoFetch">Bypassing Cloudflare, downloading full judgment text, extracting rhetorical roles, and updating RAG vector index...</p>
+        <p class="text-xs text-slate-500 mt-1" x-show="!scrapeAutoFetch">Filtering court decisions by keyword & Lucene parameters.</p>
       </div>
 
       <!-- Results Grid -->
@@ -1750,6 +1814,35 @@ def serve_dashboard() -> str:
                 <h3 class="text-sm font-bold text-white hover:text-indigo-300 transition" x-text="item.title"></h3>
               </div>
               <div class="flex items-center space-x-2">
+                <!-- If not yet downloaded & indexed in RAG -->
+                <template x-if="!isDocIndexed(item.doc_id)">
+                  <button 
+                    type="button" 
+                    @click="downloadAndIndexDoc(item)" 
+                    :disabled="downloadingDocId === item.doc_id"
+                    class="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow transition flex items-center space-x-1.5"
+                  >
+                    <span x-show="downloadingDocId !== item.doc_id"><i class="fa-solid fa-download mr-1"></i>Download & Index to RAG</span>
+                    <span x-show="downloadingDocId === item.doc_id"><i class="fa-solid fa-spinner fa-spin mr-1"></i>Indexing...</span>
+                  </button>
+                </template>
+
+                <!-- If already downloaded & indexed in RAG -->
+                <template x-if="isDocIndexed(item.doc_id)">
+                  <div class="flex items-center space-x-2">
+                    <span class="px-2.5 py-1 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded-lg text-xs font-mono font-bold flex items-center">
+                      <i class="fa-solid fa-circle-check text-emerald-400 mr-1.5"></i>Ready in RAG
+                    </span>
+                    <button 
+                      type="button" 
+                      @click="askRAGAboutDoc(item)"
+                      class="px-3 py-1 bg-indigo-900/70 hover:bg-indigo-800 text-indigo-200 rounded-lg text-xs font-semibold border border-indigo-700 transition flex items-center space-x-1"
+                    >
+                      <i class="fa-solid fa-wand-magic-sparkles mr-1 text-indigo-400"></i>Ask in RAG &rarr;
+                    </button>
+                  </div>
+                </template>
+
                 <a :href="item.source_url" target="_blank" class="px-3 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition flex items-center space-x-1.5">
                   <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
                   <span>Indian Kanoon</span>
@@ -1764,8 +1857,6 @@ def serve_dashboard() -> str:
               </div>
               <p x-html="item.headline"></p>
             </div>
-          </div>
-        </template>
       </div>
 
       <!-- Empty State -->
@@ -1878,16 +1969,31 @@ def serve_dashboard() -> str:
         copySuccess: false,
 
         // Targeted Scraper State
-        scrapeQuery: 'Section 37 NDPS commercial quantity bail',
+        scrapeQuery: 'Article 15(3) Domestic Violence Act protection',
         scrapeCourt: 'Delhi High Court',
         scrapeYear: 2023,
-        scrapeLimit: 10,
-        scrapeAutoFetch: false,
+        scrapeLimit: 3,
+        scrapeAutoFetch: true,
         scrapeLoading: false,
         scrapeData: null,
+        downloadingDocId: null,
+        indexedDocIds: [],
 
         async init() {
           this.executeSearch();
+          this.loadIndexedDocIds();
+        },
+
+        async loadIndexedDocIds() {
+          try {
+            const res = await fetch('/api/scrape/indexed-doc-ids');
+            if (res.ok) {
+              const ids = await res.json();
+              this.indexedDocIds = (ids || []).map(x => String(x));
+            }
+          } catch (e) {
+            console.error('Failed loading indexed doc ids:', e);
+          }
         },
 
         async executeSearch() {
@@ -2102,7 +2208,7 @@ def serve_dashboard() -> str:
                 query: this.scrapeQuery.trim(),
                 court: this.scrapeCourt,
                 year: this.scrapeYear ? parseInt(this.scrapeYear) : null,
-                limit: parseInt(this.scrapeLimit) || 10,
+                limit: parseInt(this.scrapeLimit) || 3,
                 auto_fetch: !!this.scrapeAutoFetch
               })
             });
@@ -2114,12 +2220,65 @@ def serve_dashboard() -> str:
             if (this.scrapeData && this.scrapeData.indexed_chunks_count) {
               this.totalIndexed = (this.totalIndexed || 0) + this.scrapeData.indexed_chunks_count;
             }
+            if (this.scrapeData && this.scrapeData.auto_fetch && this.scrapeData.results) {
+              for (const r of this.scrapeData.results) {
+                const sid = String(r.doc_id);
+                if (!this.indexedDocIds.includes(sid)) {
+                  this.indexedDocIds.push(sid);
+                }
+              }
+            }
           } catch (err) {
             console.error(err);
             alert('Error executing targeted scrape: ' + err.message);
           } finally {
             this.scrapeLoading = false;
           }
+        },
+
+        async downloadAndIndexDoc(item) {
+          this.downloadingDocId = item.doc_id;
+          try {
+            const res = await fetch('/api/scrape/download-and-index', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                doc_id: String(item.doc_id),
+                court: item.court || 'Delhi High Court',
+                year: item.year ? parseInt(item.year) : 2023,
+                title: item.title,
+                source_url: item.source_url
+              })
+            });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Download failed');
+            }
+            const data = await res.json();
+            const sid = String(item.doc_id);
+            if (!this.indexedDocIds.includes(sid)) {
+              this.indexedDocIds.push(sid);
+            }
+            if (data.indexed_chunks) {
+              this.totalIndexed = (this.totalIndexed || 0) + data.indexed_chunks;
+            }
+            alert('Success! Judgment #' + item.doc_id + ' has been downloaded, cleaned, chunked (' + data.indexed_chunks + ' chunks), and indexed into RAG. You can now query it in the Legal RAG tab!');
+          } catch (err) {
+            console.error(err);
+            alert('Failed to download & index judgment: ' + err.message);
+          } finally {
+            this.downloadingDocId = null;
+          }
+        },
+
+        askRAGAboutDoc(item) {
+          this.tab = 'rag';
+          this.ragQuery = 'What was held in ' + (item.title || 'Doc #' + item.doc_id) + '? Explain the key legal principles, ratio decidendi, and final outcome.';
+          this.executeRAG();
+        },
+
+        isDocIndexed(docId) {
+          return this.indexedDocIds.includes(String(docId));
         },
 
         getGraphNodeX(idx, total) {

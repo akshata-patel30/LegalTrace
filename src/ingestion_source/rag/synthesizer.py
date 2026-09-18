@@ -332,7 +332,7 @@ class LegalRAGSynthesizer:
             f"Provide a structured, rigorous, and citation-grounded response citing [1], [2] etc."
         )
 
-        model_name = self.settings.RAG_LLM_MODEL or "llama-3.1-70b-versatile"
+        model_name = self.settings.RAG_LLM_MODEL or "qwen/qwen3.8-27b"
         response = client.chat.completions.create(
             model=model_name,
             messages=[
