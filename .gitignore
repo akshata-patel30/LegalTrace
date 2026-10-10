@@ -1,37 +1,196 @@
-# Python & Virtual Environments
-.venv/
-venv/
-env/
+# ==============================================================================
+# LegalTrace - Robust Production .gitignore
+# Covers: Python, ML/RAG models, Embeddings, Indices, Scraped Corpus, DBs, IDEs
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Environment & Secrets (CRITICAL FOR SECURITY)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.local.env
+*.pem
+*.key
+*.cert
+*.crt
+credentials.json
+client_secret*.json
+*.token
+
+# ------------------------------------------------------------------------------
+# 2. Python Bytecode, Caches & Packaging
+# ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.egg-info/
-dist/
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Testing & Coverage
+# ------------------------------------------------------------------------------
+# 3. Virtual Environments & Package Managers
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+.uv/
+
+# ------------------------------------------------------------------------------
+# 4. Data Corpus, Scraped Stores & RAG Indices (Bulky Big Data)
+# ------------------------------------------------------------------------------
+# Scraped document storage (HTML, text, and per-doc JSONs)
+raw-store/
+raw_store/
+data/
+
+# Generated RAG hybrid indices (FAISS, BM25, embeddings)
+search_index/
+*.index
+*.faiss
+*.bin
+
+# Bulky JSONL / Parquet dumps generated during scraping & batch processing
+chunks.jsonl
+chunks.json
+all_*_cleaned_judgments.jsonl
+all_*_enriched_judgments.jsonl
+all_*_headnotes.jsonl
+all_*_structured_judgments.jsonl
+consolidated_*.jsonl
+discovered_*.jsonl
+*.parquet
+*.feather
+*.arrow
+
+# ------------------------------------------------------------------------------
+# 5. Machine Learning, Deep Learning & Checkpoints
+# ------------------------------------------------------------------------------
+checkpoints/
+checkpoint-*/
+outputs/
+models/
+runs/
+wandb/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.h5
+*.tflite
+*.ckpt
+
+# ------------------------------------------------------------------------------
+# 6. Database Files & Vector Stores
+# ------------------------------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+qdrant_storage/
+chroma_db/
+falkordb_data/
+postgres_data/
+
+# ------------------------------------------------------------------------------
+# 7. Testing, Linting & Type Checking
+# ------------------------------------------------------------------------------
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
 
-# Secrets & Environment Variables
-.env
-*.local.env
+# ------------------------------------------------------------------------------
+# 8. Jupyter Notebooks
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
 
-# Raw and bulky corpus data (managed in external volume / Parquet)
-raw-store/
-all_200_*.jsonl
-consolidated_judgments.jsonl
-discovered_200.jsonl
+# ------------------------------------------------------------------------------
+# 9. Logs, Runtime & Temporary Files
+# ------------------------------------------------------------------------------
+*.log
+logs/
+*.pid
+*.seed
+nohup.out
 scratch_*.*
-*.parquet
+temp_*.*
+tmp/
+*.tmp
+test_script*.js
 
-# Search indices (generated via `python -m ingestion_source.cli index`)
-search_index/
-
-# OS & Editor files
-.DS_Store
+# ------------------------------------------------------------------------------
+# 10. Operating System Files (Windows, macOS, Linux)
+# ------------------------------------------------------------------------------
+# Windows
 Thumbs.db
-.vscode/
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ------------------------------------------------------------------------------
+# 11. IDEs & Editors
+# ------------------------------------------------------------------------------
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm / IntelliJ
 .idea/
+*.iws
+*.iml
+
+# Other editors
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~

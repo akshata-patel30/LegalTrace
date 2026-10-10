@@ -459,9 +459,20 @@ class TargetedScrapeRequest(BaseModel):
     query: str = Field(..., description="Targeted legal query or keywords (e.g. 'Section 37 NDPS commercial quantity bail')")
     court: str = Field("Delhi High Court", description="Target court name (e.g. 'Delhi High Court')")
     year: Optional[int] = Field(2023, description="Decision year (or None for all years)")
-    limit: int = Field(10, ge=1, le=50, description="Max candidate judgments to return")
+    limit: int = Field(10, ge=1, le=500, description="Max candidate judgments to return")
     source_mode: str = Field("auto", description="Discovery source mode: auto | seed | api | scrape")
     auto_fetch: bool = Field(False, description="Whether to automatically download and store full text into raw-store")
+
+
+class ArticleScrapeRequest(BaseModel):
+    articles: str = Field(..., description="One or more Constitutional Articles or statutory provisions (e.g. 'Article 21\\nArticle 226', 'Article 32', 'Article 14, Article 19')")
+    keywords: Optional[str] = Field(None, description="Optional search keywords or doctrine filters (e.g. 'bail commercial quantity', 'preventive detention', 'quashing FIR')")
+    court: str = Field("Supreme Court of India", description="Target court name (e.g. 'Supreme Court of India', 'Delhi High Court', 'All Courts')")
+    year: Optional[int] = Field(2023, description="Decision year (or None / 0 for all years)")
+    limit: int = Field(10, ge=1, le=500, description="Total candidate judgments to scrape (1 to 500)")
+    source_mode: str = Field("auto", description="Discovery source mode: auto | scrape | api | seed")
+    auto_fetch: bool = Field(True, description="Automatically download full text and index into RAG vector corpus")
+
 
 
 
@@ -770,6 +781,157 @@ def get_indexed_doc_ids() -> list[str]:
         return []
 
 
+@app.post("/api/scrape/articles")
+def scrape_articles_api(req: ArticleScrapeRequest) -> dict[str, Any]:
+    """Large-scale Constitutional Article and Statute judgment discovery with auto-indexing."""
+    from ingestion_source.config import get_settings
+    from ingestion_source.discovery import DiscoveryEngine
+    from ingestion_source.job import JobOrchestrator
+
+    settings = get_settings()
+    engine = DiscoveryEngine(settings=settings)
+
+    # 1. Parse articles input (handles newlines, commas, semicolons)
+    raw_lines = re.split(r"[\n,;]+", req.articles)
+    parsed_articles: list[str] = []
+    for line in raw_lines:
+        token = line.strip()
+        if not token:
+            continue
+        # Normalize e.g. "21" -> "Article 21", "art 21" -> "Article 21", "art. 21" -> "Article 21"
+        if token.isdigit():
+            token = f"Article {token}"
+        elif re.match(r"^art\.?\s*(\d+.*)", token, re.IGNORECASE):
+            num = re.sub(r"^art\.?\s*", "", token, flags=re.IGNORECASE).strip()
+            token = f"Article {num}"
+        if token not in parsed_articles:
+            parsed_articles.append(token)
+
+    if not parsed_articles:
+        fallback = req.articles.strip()
+        if fallback:
+            parsed_articles = [fallback]
+        else:
+            raise HTTPException(status_code=400, detail="Please enter at least one valid Article name or statute.")
+
+    # 2. Determine target courts and years
+    court_input = (req.court or "").strip()
+    if court_input.lower() in ("all", "all courts", "all courts (aggregated)"):
+        target_courts = [
+            "Supreme Court of India",
+            "Delhi High Court",
+            "Bombay High Court",
+            "Calcutta High Court",
+            "Karnataka High Court",
+            "Allahabad High Court",
+        ]
+    elif court_input:
+        target_courts = [court_input]
+    else:
+        target_courts = ["Supreme Court of India"]
+
+    target_years = [req.year] if (req.year and req.year > 0) else None
+
+    # 3. Build queries for each article
+    kw = (req.keywords or "").strip()
+    seen_doc_ids: set[str] = set()
+    all_refs = []
+    queries_executed: list[str] = []
+
+    limit_per_article = max(3, req.limit // len(parsed_articles))
+
+    for article in parsed_articles:
+        if "constitution" not in article.lower() and (article.lower().startswith("article") or article.lower().startswith("art")):
+            base_q = f"{article} Constitution of India"
+        else:
+            base_q = article
+
+        if kw:
+            full_query = f"{base_q} {kw}"
+        else:
+            full_query = base_q
+
+        queries_executed.append(full_query)
+
+        try:
+            refs = list(engine.discover_refs(
+                courts=target_courts,
+                years=target_years,
+                limit_per_target=limit_per_article,
+                total_limit=limit_per_article,
+                source_mode=req.source_mode,
+                query=full_query,
+            ))
+        except Exception as e:
+            logger.warning("Error discovering refs for query '%s': %s", full_query, e)
+            refs = []
+
+        for r in refs:
+            if r.doc_id not in seen_doc_ids:
+                seen_doc_ids.add(r.doc_id)
+                all_refs.append(r)
+                if len(all_refs) >= req.limit:
+                    break
+
+        if len(all_refs) >= req.limit:
+            break
+
+    results_data = [
+        {
+            "doc_id": r.doc_id,
+            "title": r.title,
+            "court": r.court,
+            "year": r.year,
+            "source_url": r.source_url,
+            "headline": r.headline,
+            "month": r.month,
+        }
+        for r in all_refs
+    ]
+
+    fetched_count = 0
+    job_id = None
+    indexed_chunks_count = 0
+
+    if req.auto_fetch and all_refs:
+        orchestrator = JobOrchestrator(settings=settings)
+        job_id = orchestrator.create_job(all_refs, mode=settings.MODE)
+        report = orchestrator.execute_job(job_id=job_id, limit=len(all_refs), workers=1)
+        fetched_count = getattr(report, "stored_count", 0)
+
+        try:
+            from ingestion_source.pipeline_processor import process_and_index_scraped_documents
+            engine_inst = None
+            try:
+                engine_inst = get_engine()
+            except Exception as e:
+                logger.warning("Search engine could not be acquired for auto-indexing: %s", e)
+
+            proc_stats = process_and_index_scraped_documents(
+                doc_refs=all_refs,
+                settings=settings,
+                search_engine=engine_inst,
+                index_dir=INDEX_DIR,
+            )
+            indexed_chunks_count = proc_stats.get("indexed_chunks", 0)
+        except Exception as e:
+            logger.warning("Downstream pipeline processing failed: %s", e)
+
+    return {
+        "status": "success",
+        "articles": parsed_articles,
+        "queries_executed": queries_executed,
+        "court": req.court,
+        "year": req.year if (req.year and req.year > 0) else None,
+        "total_discovered": len(all_refs),
+        "auto_fetch": req.auto_fetch,
+        "fetched_count": fetched_count,
+        "indexed_chunks_count": indexed_chunks_count,
+        "job_id": job_id,
+        "results": results_data,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Interactive Web Explorer Dashboard (HTML5 + Tailwind CSS SPA)
 # ---------------------------------------------------------------------------
@@ -831,6 +993,9 @@ def serve_dashboard() -> str:
         </button>
         <button @click="tab = 'scrape'" :class="tab === 'scrape' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
           <i class="fa-solid fa-cloud-arrow-down mr-1.5"></i>Keyword Scraper
+        </button>
+        <button @click="tab = 'article-scrape'" :class="tab === 'article-scrape' ? 'bg-indigo-600 text-white font-medium' : 'text-slate-400 hover:text-white'" class="px-3 py-1.5 rounded-md text-xs transition">
+          <i class="fa-solid fa-landmark mr-1.5"></i>Article Scraper
         </button>
       </nav>
 
@@ -1869,6 +2034,261 @@ def serve_dashboard() -> str:
       </div>
     </div>
 
+    <!-- ================================================================= -->
+    <!-- TAB: CONSTITUTIONAL ARTICLE & STATUTE LARGE-SCALE SCRAPER -->
+    <!-- ================================================================= -->
+    <div x-show="tab === 'article-scrape'" x-cloak x-transition>
+      <div class="bg-slate-800/80 rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h2 class="text-base font-bold text-white flex items-center">
+              <i class="fa-solid fa-landmark text-indigo-400 mr-2"></i>
+              Constitutional Article & Statute Large-Scale Scraper
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">
+              Batch scrape judgments by Constitutional Article(s) or statutes (e.g. Article 21, 226, 32), contextual keywords, court, and year. Directly auto-cleans, classifies rhetorical roles, and indexes into the RAG corpus.
+            </p>
+          </div>
+          <div class="hidden sm:flex items-center space-x-2 text-xs text-slate-400 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-700">
+            <i class="fa-solid fa-microchip text-indigo-400"></i>
+            <span>Indian Kanoon &bull; Pipeline Auto-Index</span>
+          </div>
+        </div>
+
+        <!-- Form -->
+        <form @submit.prevent="executeArticleScrape" class="space-y-4">
+          <!-- Textarea for Article(s) -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-200 mb-1.5 flex items-center justify-between">
+              <span>Constitutional Article(s) or Statutory Provisions <span class="text-indigo-400 font-mono text-[11px]">(One per line or comma-separated)</span></span>
+              <span class="text-[11px] text-slate-400 font-normal">Supports: Article 21, 226, 32, Section 482 CrPC, etc.</span>
+            </label>
+            <textarea 
+              x-model="articleText" 
+              rows="3"
+              placeholder="e.g.&#10;Article 21&#10;Article 226&#10;Article 32&#10;Article 14"
+              class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm font-mono shadow-inner leading-relaxed"
+              required
+            ></textarea>
+          </div>
+
+          <!-- Quick Presets -->
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span class="text-slate-400 font-medium">Quick Presets:</span>
+            <button type="button" @click="setArticlePreset('Article 21', 'bail personal liberty procedure established by law')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">Art. 21 (Liberty & Bail)</button>
+            <button type="button" @click="setArticlePreset('Article 226', 'writ mandamus certiorari alternative remedy')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">Art. 226 (HC Writs)</button>
+            <button type="button" @click="setArticlePreset('Article 32, Article 136', 'special leave petition fundamental rights')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">Art. 32 & 136 (SC Writs/SLP)</button>
+            <button type="button" @click="setArticlePreset('Article 14, Article 19', 'arbitrariness reasonable classification fundamental freedom')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">Art. 14 & 19 (Equality & Speech)</button>
+            <button type="button" @click="setArticlePreset('Section 482 CrPC, Article 226', 'quashing FIR matrimonial dispute inherent powers')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">S.482 & Art. 226 (Quashing FIR)</button>
+            <button type="button" @click="setArticlePreset('Article 300A', 'right to property authority of law acquisition compensation')" class="px-2.5 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition">Art. 300A (Property Rights)</button>
+          </div>
+
+          <!-- Keywords Input -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-200 mb-1.5 flex items-center justify-between">
+              <span>Optional Contextual Keywords / Legal Issues</span>
+              <span class="text-[11px] text-slate-400 font-normal">Lucene keyword matching on case text & facts</span>
+            </label>
+            <div class="relative">
+              <i class="fa-solid fa-tags absolute left-4 top-3.5 text-slate-500 text-sm"></i>
+              <input 
+                type="text" 
+                x-model="articleKeywords" 
+                placeholder="e.g. 'bail commercial quantity NDPS', 'preventive detention grounds', 'manifest arbitrariness in tender'..."
+                class="w-full pl-11 pr-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm shadow-inner"
+              />
+            </div>
+          </div>
+
+          <!-- Controls Grid: Court, Year, Number to Scrape, Auto-Index -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2">
+            <!-- Court Selector -->
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Target Court</label>
+              <select x-model="articleCourt" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer">
+                <option value="Supreme Court of India" class="bg-slate-800">Supreme Court of India</option>
+                <option value="Delhi High Court" class="bg-slate-800">Delhi High Court</option>
+                <option value="Bombay High Court" class="bg-slate-800">Bombay High Court</option>
+                <option value="Calcutta High Court" class="bg-slate-800">Calcutta High Court</option>
+                <option value="Karnataka High Court" class="bg-slate-800">Karnataka High Court</option>
+                <option value="Allahabad High Court" class="bg-slate-800">Allahabad High Court</option>
+                <option value="Madras High Court" class="bg-slate-800">Madras High Court</option>
+                <option value="All Courts" class="bg-slate-800">All Courts (Multi-Jurisdiction)</option>
+              </select>
+            </div>
+
+            <!-- Year Selector -->
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Decision Year</label>
+              <select x-model.number="articleYear" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer">
+                <option value="2025" class="bg-slate-800">2025 (Latest)</option>
+                <option value="2024" class="bg-slate-800">2024</option>
+                <option value="2023" class="bg-slate-800" selected>2023</option>
+                <option value="2022" class="bg-slate-800">2022</option>
+                <option value="2021" class="bg-slate-800">2021</option>
+                <option value="2020" class="bg-slate-800">2020</option>
+                <option value="2019" class="bg-slate-800">2019</option>
+                <option value="0" class="bg-slate-800">All Years (Unrestricted History)</option>
+              </select>
+            </div>
+
+            <!-- Limit Selector -->
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Number to Scrape (Scale)</label>
+              <select x-model.number="articleLimit" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer font-semibold text-indigo-300">
+                <option value="5">5 judgments (Rapid Test)</option>
+                <option value="10" selected>10 judgments (Standard Batch)</option>
+                <option value="25">25 judgments (Comprehensive)</option>
+                <option value="50">50 judgments (Deep Corpus)</option>
+                <option value="100">100 judgments (Large-Scale)</option>
+                <option value="200">200 judgments (Mega Corpus)</option>
+              </select>
+            </div>
+
+            <!-- Auto-Fetch & Index Checkbox -->
+            <div class="flex flex-col justify-end">
+              <label class="flex items-center space-x-2.5 bg-slate-900 px-3 py-2.5 rounded-xl border border-slate-700 cursor-pointer hover:border-slate-600 transition" title="Automatically download full text, clean, structure, chunk, and index into RAG vector engine">
+                <input type="checkbox" x-model="articleAutoFetch" class="rounded text-indigo-600 focus:ring-0">
+                <div class="leading-tight">
+                  <span :class="articleAutoFetch ? 'text-emerald-400 font-bold' : 'text-slate-400'" class="text-xs flex items-center">
+                    <i class="fa-solid fa-bolt mr-1.5 text-amber-400"></i>Auto-Index to RAG
+                  </span>
+                  <span class="text-[10px] text-slate-500 block">Clean & Chunker Pipeline</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Submit Button -->
+          <div class="pt-2">
+            <button 
+              type="submit" 
+              :disabled="articleLoading"
+              class="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold tracking-wide uppercase shadow-lg shadow-indigo-600/30 transition flex items-center justify-center space-x-2"
+            >
+              <span x-show="!articleLoading" class="flex items-center space-x-2">
+                <i class="fa-solid fa-satellite-dish text-sm"></i>
+                <span>Scrape & Index Judgments</span>
+              </span>
+              <span x-show="articleLoading" class="flex items-center space-x-2">
+                <i class="fa-solid fa-spinner fa-spin text-sm"></i>
+                <span>Executing Large-Scale Ingestion Pipeline...</span>
+              </span>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Telemetry & Summary Banner -->
+      <div x-show="articleData" class="mb-6 bg-slate-800/60 rounded-xl p-5 border border-slate-700 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+          <div class="h-10 w-10 rounded-xl bg-indigo-900/60 border border-indigo-700 flex items-center justify-center text-indigo-400 font-bold text-lg">
+            <i class="fa-solid fa-database"></i>
+          </div>
+          <div>
+            <div class="text-xs font-bold text-white flex items-center space-x-2">
+              <span>Articles Ingested:</span>
+              <template x-for="art in (articleData?.articles || [])" :key="art">
+                <span class="px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800 font-mono text-[11px]" x-text="art"></span>
+              </template>
+            </div>
+            <div class="text-[11px] text-slate-400 font-mono mt-1">
+              Court: <span class="text-slate-200" x-text="articleData?.court"></span> | Year: <span class="text-slate-200" x-text="articleData?.year || 'All'"></span> | Discovered: <span class="text-indigo-400 font-bold" x-text="articleData?.total_discovered || 0"></span> judgments
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-3 text-xs font-mono">
+          <div x-show="articleData?.auto_fetch" class="px-3 py-1.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-800">
+            <i class="fa-solid fa-file-arrow-down mr-1 text-emerald-400"></i>
+            Stored: <span class="font-bold" x-text="articleData?.fetched_count || 0"></span> cases
+          </div>
+          <div x-show="articleData?.indexed_chunks_count" class="px-3 py-1.5 rounded-lg bg-indigo-950 text-indigo-300 border border-indigo-800">
+            <i class="fa-solid fa-brain mr-1 text-indigo-400"></i>
+            RAG Chunks: <span class="font-bold" x-text="articleData?.indexed_chunks_count || 0"></span>
+          </div>
+          <div class="text-slate-400 text-[11px]">
+            Job ID: <span class="text-slate-200" x-text="articleData?.job_id || 'discovery_only'"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loading State -->
+      <div x-show="articleLoading" class="py-16 text-center">
+        <i class="fa-solid fa-circle-notch fa-spin text-4xl text-indigo-500 mb-4"></i>
+        <p class="text-sm font-medium text-slate-300">Searching Indian Kanoon for Constitutional Articles & Keywords...</p>
+        <p class="text-xs text-slate-500 mt-1" x-show="articleAutoFetch">Downloading judgment texts, cleaning OCR noise, classifying rhetorical roles, generating semantic chunks, and updating live RAG vector index...</p>
+        <p class="text-xs text-slate-500 mt-1" x-show="!articleAutoFetch">Enumerating candidate judgments matching article queries and court parameters...</p>
+      </div>
+
+      <!-- Results Grid -->
+      <div x-show="!articleLoading && articleData && articleData.results && articleData.results.length > 0" class="space-y-4">
+        <template x-for="item in (articleData?.results || [])" :key="item.doc_id">
+          <div class="p-5 bg-slate-800/80 rounded-2xl border border-slate-700 hover:border-slate-600 transition shadow-lg space-y-3">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div class="space-y-1">
+                <div class="flex items-center space-x-2">
+                  <span class="text-xs font-mono px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800 font-bold" x-text="'Doc #' + item.doc_id"></span>
+                  <span class="text-xs text-slate-400 font-mono" x-text="item.court + (item.year ? ' • ' + item.year : '')"></span>
+                </div>
+                <h3 class="text-sm font-bold text-white hover:text-indigo-300 transition" x-text="item.title"></h3>
+              </div>
+              <div class="flex items-center space-x-2">
+                <!-- If not yet downloaded & indexed in RAG -->
+                <template x-if="!isDocIndexed(item.doc_id)">
+                  <button 
+                    type="button" 
+                    @click="downloadAndIndexDoc(item)" 
+                    :disabled="downloadingDocId === item.doc_id"
+                    class="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow transition flex items-center space-x-1.5"
+                  >
+                    <span x-show="downloadingDocId !== item.doc_id"><i class="fa-solid fa-download mr-1"></i>Download & Index to RAG</span>
+                    <span x-show="downloadingDocId === item.doc_id"><i class="fa-solid fa-spinner fa-spin mr-1"></i>Indexing...</span>
+                  </button>
+                </template>
+
+                <!-- If already downloaded & indexed in RAG -->
+                <template x-if="isDocIndexed(item.doc_id)">
+                  <div class="flex items-center space-x-2">
+                    <span class="px-2.5 py-1 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded-lg text-xs font-mono font-bold flex items-center">
+                      <i class="fa-solid fa-circle-check text-emerald-400 mr-1.5"></i>Ready in RAG
+                    </span>
+                    <button 
+                      type="button" 
+                      @click="askRAGAboutDoc(item)"
+                      class="px-3 py-1 bg-indigo-900/70 hover:bg-indigo-800 text-indigo-200 rounded-lg text-xs font-semibold border border-indigo-700 transition flex items-center space-x-1"
+                    >
+                      <i class="fa-solid fa-wand-magic-sparkles mr-1 text-indigo-400"></i>Ask in RAG &rarr;
+                    </button>
+                  </div>
+                </template>
+
+                <a :href="item.source_url" target="_blank" class="px-3 py-1 bg-slate-900 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition flex items-center space-x-1.5">
+                  <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+                  <span>Indian Kanoon</span>
+                </a>
+              </div>
+            </div>
+
+            <!-- Snippet / Headline if available -->
+            <div x-show="item.headline" class="p-3 bg-slate-950 rounded-xl border border-slate-800/80 text-xs text-slate-300 font-serif leading-relaxed">
+              <div class="text-[10px] font-mono text-indigo-400 uppercase tracking-wider mb-1 flex items-center">
+                <i class="fa-solid fa-highlighter mr-1"></i> SERP Context Snippet
+              </div>
+              <p x-html="item.headline"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Empty State -->
+      <div x-show="!articleLoading && articleData && (!articleData.results || articleData.results.length === 0)" class="py-16 text-center bg-slate-800/40 rounded-2xl border border-slate-700/60">
+        <i class="fa-solid fa-folder-open text-4xl text-slate-600 mb-3"></i>
+        <p class="text-sm text-slate-400 font-medium">No judgments found matching these articles and court parameters.</p>
+        <p class="text-xs text-slate-500 mt-1">Try broadening your article names or selecting "All Years" or "All Courts".</p>
+      </div>
+    </div>
+
   </main>
 
   <!-- ================================================================= -->
@@ -1980,6 +2400,16 @@ def serve_dashboard() -> str:
         scrapeData: null,
         downloadingDocId: null,
         indexedDocIds: [],
+
+        // Constitutional Article & Statute Large-Scale Scraper State
+        articleText: 'Article 21, Article 226',
+        articleKeywords: 'bail personal liberty',
+        articleCourt: 'Supreme Court of India',
+        articleYear: 2023,
+        articleLimit: 10,
+        articleAutoFetch: true,
+        articleLoading: false,
+        articleData: null,
 
         async init() {
           this.executeSearch();
@@ -2235,6 +2665,51 @@ def serve_dashboard() -> str:
             alert('Error executing targeted scrape: ' + err.message);
           } finally {
             this.scrapeLoading = false;
+          }
+        },
+
+        setArticlePreset(articles, keywords) {
+          this.articleText = articles;
+          this.articleKeywords = keywords;
+        },
+
+        async executeArticleScrape() {
+          if (!this.articleText.trim()) return;
+          this.articleLoading = true;
+          try {
+            const res = await fetch('/api/scrape/articles', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                articles: this.articleText.trim(),
+                keywords: this.articleKeywords ? this.articleKeywords.trim() : null,
+                court: this.articleCourt,
+                year: this.articleYear ? parseInt(this.articleYear) : null,
+                limit: parseInt(this.articleLimit) || 10,
+                auto_fetch: !!this.articleAutoFetch
+              })
+            });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Article scraping failed');
+            }
+            this.articleData = await res.json();
+            if (this.articleData && this.articleData.indexed_chunks_count) {
+              this.totalIndexed = (this.totalIndexed || 0) + this.articleData.indexed_chunks_count;
+            }
+            if (this.articleData && this.articleData.auto_fetch && this.articleData.results) {
+              for (const r of this.articleData.results) {
+                const sid = String(r.doc_id);
+                if (!this.indexedDocIds.includes(sid)) {
+                  this.indexedDocIds.push(sid);
+                }
+              }
+            }
+          } catch (err) {
+            console.error(err);
+            alert('Error executing article scrape: ' + err.message);
+          } finally {
+            this.articleLoading = false;
           }
         },
 
